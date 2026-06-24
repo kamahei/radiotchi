@@ -1,0 +1,9 @@
+Use case: game-assets
+Asset type: source sprite sheet for replacing only Pure adult Radiotchi sprites
+Input image roles: visible probe_cat.png is the style reference for thin 1-bit line weight; visible current Pure sheet shows the five designs to improve by making the linework lighter and less filled-in.
+Primary request: Generate a clean black-and-white pixel-art sprite sheet with exactly 5 separate adult Pure virtual pet sprites for a Flipper Zero monochrome display. Use animal family motifs in this exact order, left to right in one row: pure turtle, pure rabbit, pure cat, pure bird, pure owl.
+Style/medium: strict 1-bit black and white pixel art, pure black #000000 and pure white #FFFFFF, no gray, no anti-aliasing, no color. Cute handheld LCD virtual-pet sprite style, matching the probe cat reference.
+Line weight: use thin, crisp 1-pixel-like black outlines with sparse detail. Avoid thick black borders, heavy black fills, chunky silhouettes, and large solid black areas. Keep white interior spaces open and readable.
+Composition/framing: one row of 5 equal square cells on a white background with clear gutters; each sprite centered in its own cell; no labels or text. Keep each character readable at 64x64 with simple open silhouettes.
+Creature notes: turtle has shell and squat body; rabbit has long ears; cat has point ears, whiskers, and tail; bird has beak and small wing; owl has large eyes and small wings. These are Pure variants, so keep each iconic and simple with no sprout, crest, woven pattern, or diffuse markings.
+Constraints: no text, no labels, no watermark, no shadows, no gradients. Do not use paired-creature designs, duplicate bodies, or two animals sharing one cell.

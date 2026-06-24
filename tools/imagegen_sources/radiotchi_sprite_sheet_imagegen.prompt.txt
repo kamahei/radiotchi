@@ -1,0 +1,16 @@
+Use case: game-assets
+Asset type: source sprite sheet for final 64x64 Radiotchi pet sprites
+Input image role: the visible probe_cat.png is the style reference. Match its cute Tamagotchi-like 1-bit pixel-art look: thin black outline, white fill, rounded face, simple dot eyes, small paws, no shading.
+Primary request: Generate a clean black-and-white pixel-art sprite sheet with exactly 31 separate virtual pet sprites for a Flipper Zero monochrome display. Use animal family motifs, no labels and no text.
+Required sprite order, left to right then top to bottom, in a 6-column grid:
+Row 1: egg, baby turtle, baby rabbit, baby cat, baby bird, baby owl.
+Row 2: adult turtle pure, adult turtle sprout, adult turtle crested, adult turtle woven, adult turtle diffuse.
+Row 3: adult rabbit pure, adult rabbit sprout, adult rabbit crested, adult rabbit woven, adult rabbit diffuse.
+Row 4: adult cat pure, adult cat sprout, adult cat crested, adult cat woven, adult cat diffuse.
+Row 5: adult bird pure, adult bird sprout, adult bird crested, adult bird woven, adult bird diffuse.
+Row 6: adult owl pure, adult owl sprout, adult owl crested, adult owl woven, adult owl diffuse.
+Style/medium: strict 1-bit black and white pixel art, pure black #000000 and pure white #FFFFFF, no gray, no anti-aliasing, no color. Cute handheld LCD virtual-pet sprite style, matching the probe cat reference.
+Line weight: use thin, crisp 1-pixel-like black outlines with sparse detail. Avoid thick black borders, heavy black fills, chunky silhouettes, and large solid black areas. Keep white interior spaces open and readable.
+Composition/framing: white background; each sprite centered in its own equal square cell with clear gutters; all sprites isolated and complete; simple readable silhouettes. The 6th cell in rows 2-6 may remain blank white because those rows have only five adult sprites.
+Creature variation: turtle family has shells and squat bodies; rabbit family has long ears and energetic poses; cat family has point ears, whiskers, tail; bird family has beak, wings, crest/plume; owl family has large eyes and ear tufts. pure is iconic/simple; sprout has one small emerging secondary-trait sprout, leaf, bud, feather tuft, or side charm but never two heads and never two animals; crested has one prominent crest/horn/plume; woven has interlaced or patterned markings; diffuse is softer/flatter/generalist.
+Constraints: no text, no labels, no watermark, no shadows, no gradients. Avoid paired-creature designs, two-headed creatures, mirrored duplicate heads, duplicate bodies, or two animals sharing one cell. Keep sprites small, centered, and readable at 64x64. Preserve the reference image's simple black outline and white interior style.

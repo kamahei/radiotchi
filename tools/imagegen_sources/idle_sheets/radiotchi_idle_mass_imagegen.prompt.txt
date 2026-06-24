@@ -1,0 +1,8 @@
+Use case: stylized-concept
+Asset type: Radiotchi 1-bit virtual pet idle animation sprite sheet
+Input image: the visible reference image is the exact neutral static design reference for MASS turtle-family adult sprites, left to right: pure, sprout, crested, woven, diffuse.
+Primary request: Create a clean animation source sheet with exactly 5 rows and 4 columns. Each row is one turtle-family character from the reference image in the same order; each column is one frame of a 4-frame idle loop.
+Style/medium: cute Tamagotchi-like 1-bit pixel sprite line art, pure black lines on pure white cells, thin crisp 1-pixel-like outlines, open white interiors.
+Composition/framing: each cell contains one centered 64x64-style sprite with generous white margin. Use a thin light-gray grid to separate cells. No text labels.
+Animation directions: column 1 neutral pose matching the reference; column 2 head extends a tiny amount; column 3 head retracts slightly with one blink; column 4 return pose. Keep the shell, legs, belly, and decorative shape trait visually stable. Keep sprout/crest/woven/diffuse visual traits consistent across all frames.
+Constraints: preserve each character identity and silhouette from the reference. Do not crop. Do not distort bodies. Do not use disconnected line fragments. ABSOLUTELY NO motion lines, no speed marks, no sparkle marks, no emphasis marks, no extra decorative marks outside the body. Do not add labels, numbers, UI, shadows, gray shading, color, or background art. Output should be a single contact sheet only.
