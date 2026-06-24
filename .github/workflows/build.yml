@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host unit tests (Analysis Core + pet growth)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run libm-free host tests
+        run: make -C test
+
+  fap:
+    name: Build the FAP (ufbt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Cache the ufbt SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.ufbt
+          key: ufbt-${{ runner.os }}-release
+      - name: Install ufbt + fetch SDK
+        run: |
+          pip install ufbt
+          ufbt update --channel=release
+      - name: Build radiotchi.fap
+        run: ufbt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: radiotchi-fap
+          path: dist/*.fap
+          if-no-files-found: error

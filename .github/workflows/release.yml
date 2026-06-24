@@ -1,0 +1,43 @@
+name: release
+
+# Push a version tag to build the release FAP and publish a GitHub Release:
+#   git tag v1.0 && git push origin v1.0
+# The build is a RELEASE build (RADIOTCHI_DEBUG off), so the dev sprite gallery is excluded.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Cache the ufbt SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.ufbt
+          key: ufbt-${{ runner.os }}-release
+      - name: Install ufbt + fetch SDK
+        run: |
+          pip install ufbt
+          ufbt update --channel=release
+      - name: Host unit tests
+        run: make -C test
+      - name: Build radiotchi.fap (release)
+        run: ufbt
+      - name: Name the artifact with the tag
+        run: cp dist/radiotchi.fap "radiotchi-${{ github.ref_name }}.fap"
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: radiotchi-*.fap
+          generate_release_notes: true
+          fail_on_unmatched_files: true
