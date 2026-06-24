@@ -1,0 +1,37 @@
+# Radiotchi - Flipper FAP manifest.
+# Build/run with ufbt:  ufbt launch   (manifest auto-discovered)
+App(
+    appid="radiotchi",
+    name="Radiotchi",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="radiotchi_app",
+    stack_size=4 * 1024,
+    fap_category="Sub-GHz",
+    fap_version="1.0",
+    fap_description="A Tamagotchi-style pet you feed with real Sub-GHz radio signals. "
+    "Hop the bands, catch the strongest signal, read its 5-axis nutrition label, and grow a "
+    "creature shaped by your RF diet - all logged in a dex. RX-only.",
+    fap_author="Kamahei",
+    fap_icon="radiotchi_icon.png",
+    # Image-generated 1-bit pet sprites. fbt compiles every icons/*.png into
+    # radiotchi_icons.h as `const Icon I_<name>;`, drawn by reference in pet_sprites.c.
+    fap_icon_assets="icons",
+    # Dev-only sprite gallery: uncomment to enable the "Debug" Home-menu tool. Release
+    # builds leave it off (RADIOTCHI_DEBUG undefined => the Debug command/screen compile out).
+    # cdefines=["RADIOTCHI_DEBUG=1"],
+    # Game Shell + capture adapters (Flipper-only) build as the app's own sources.
+    sources=[
+        "src/**/*.c",
+    ],
+    # The Analysis Core is portable, host-testable pure C. fbt requires private
+    # libraries to live under lib/<name>; declaring it here puts lib/analysis_core
+    # on the include path for the whole FAP (so "analysis_core.h" / "radiotchi_types.h"
+    # resolve everywhere) while keeping it a separately-built, dependency-free unit.
+    fap_private_libs=[
+        Lib(
+            name="analysis_core",
+            fap_include_paths=["."],
+            sources=["*.c"],
+        ),
+    ],
+)

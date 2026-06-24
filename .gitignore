@@ -1,0 +1,36 @@
+# --- Dev environment ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- ufbt / Flipper build artifacts ---
+.ufbt/
+dist/
+build/
+*.fap
+*.fap.dbg
+
+# --- Host test build artifacts ---
+test/build/
+*.o
+*.obj
+*.exe
+*.out
+
+# --- Generated sprite previews (rebuild with tools/preview_sprites.py) ---
+preview/
+preview_*.png
+*_demo.gif
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Captured data (do NOT commit personal RF captures / identifiers) ---
+# Per privacy guardrail: captures stay local and are never exported.
+captures/
+*.sub
+!fixtures/**/*.sub
