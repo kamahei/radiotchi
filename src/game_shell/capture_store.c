@@ -128,14 +128,16 @@ static int to_centi(float v) {
     return (int)(v * 100.0f + (v >= 0.0f ? 0.5f : -0.5f));
 }
 
-bool capture_store_load_growth(CaptureStore* store, PetGrowth* out, char* name, size_t name_cap) {
+bool capture_store_load_growth(
+    CaptureStore* store, PetGrowth* out, PetCare* care, char* name, size_t name_cap) {
     if(store == NULL || out == NULL) return false;
+    if(care != NULL) pet_care_init(care); // never-fed default; overwritten if a care= line exists
     if(!storage_file_exists(store->storage, RADIOTCHI_GROWTH_PATH)) return false;
 
     File* f = storage_file_alloc(store->storage);
     bool ok = false;
     if(storage_file_open(f, RADIOTCHI_GROWTH_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        char buf[192] = {0};
+        char buf[256] = {0};
         size_t n = storage_file_read(f, buf, sizeof(buf) - 1);
         buf[n] = '\0';
         int s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
@@ -176,20 +178,34 @@ bool capture_store_load_growth(CaptureStore* store, PetGrowth* out, char* name, 
                 name[i] = '\0';
             }
         }
+        // Optional "care=<last_feed_time> <last_meal_quality>" line. Absent in pre-care files,
+        // which then keep the never-fed grace set above (no false starvation on upgrade).
+        if(ok && care != NULL) {
+            const char* p = strstr(buf, "care=");
+            if(p != NULL) {
+                unsigned long long lft = 0;
+                unsigned q = 0;
+                if(sscanf(p + 5, "%llu %u", &lft, &q) >= 1) {
+                    care->last_feed_time = (uint64_t)lft;
+                    care->last_meal_quality = (uint8_t)(q > 100u ? 100u : q);
+                }
+            }
+        }
     }
     storage_file_close(f);
     storage_file_free(f);
     return ok;
 }
 
-void capture_store_save_growth(CaptureStore* store, const PetGrowth* g, const char* name) {
+void capture_store_save_growth(
+    CaptureStore* store, const PetGrowth* g, const PetCare* care, const char* name) {
     if(store == NULL || g == NULL) return;
     File* f = storage_file_alloc(store->storage);
     if(storage_file_open(f, RADIOTCHI_GROWTH_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         FuriString* s = furi_string_alloc();
         furi_string_printf(
             s,
-            "s0=%d s1=%d s2=%d s3=%d s4=%d exp=%lu level=%u type=%u\nname=%s\n",
+            "s0=%d s1=%d s2=%d s3=%d s4=%d exp=%lu level=%u type=%u\nname=%s\ncare=%llu %u\n",
             to_centi(g->stat[0]),
             to_centi(g->stat[1]),
             to_centi(g->stat[2]),
@@ -198,7 +214,9 @@ void capture_store_save_growth(CaptureStore* store, const PetGrowth* g, const ch
             (unsigned long)g->total_exp,
             (unsigned)g->level,
             (unsigned)g->type_id,
-            (name != NULL ? name : ""));
+            (name != NULL ? name : ""),
+            (unsigned long long)(care != NULL ? care->last_feed_time : 0u),
+            (unsigned)(care != NULL ? care->last_meal_quality : 0u));
         file_write_str(f, furi_string_get_cstr(s));
         furi_string_free(s);
     }
@@ -389,49 +407,142 @@ void capture_store_for_each_row(
     storage_file_free(f);
 }
 
+// --- diff-learning payload collection --------------------------------------
+
+// Decode one stored `.sub` to its frame bytes for the diff view: the OOK fixed-code (packed
+// MSB-first) or the 2FSK sensor frame. READ-ONLY. Returns the byte length (0 if it doesn't
+// decode). Note: read_sub_pulses is defined in the re-grade section below; forward-declared.
+static uint16_t read_sub_pulses(Storage* storage, const char* sub_path, int16_t* pulses, uint16_t cap);
+
+static uint16_t decode_sub_payload(
+    Storage* storage, const char* sub_path, Modulation mod, uint8_t* out, uint16_t cap) {
+    int16_t pulses[RADIOTCHI_PULSES_MAX];
+    uint16_t pc = read_sub_pulses(storage, sub_path, pulses, RADIOTCHI_PULSES_MAX);
+    if(pc == 0) return 0;
+
+    if(mod == MOD_2FSK) {
+        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+        uint16_t flen = 0;
+        if(!radiotchi_fsk_sensor_decode(pulses, pc, frame, sizeof(frame), &flen)) return 0;
+        if(flen > cap) flen = cap;
+        memcpy(out, frame, flen);
+        return flen;
+    }
+
+    uint32_t code = 0;
+    uint8_t nbits = 0;
+    if(!radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) return 0;
+    uint16_t nbytes = (uint16_t)((nbits + 7u) / 8u);
+    if(nbytes > cap) nbytes = cap;
+    for(uint16_t i = 0; i < nbytes; i++) { // pack the code MSB-first (stable across captures)
+        uint8_t shift = (uint8_t)((nbytes - 1u - i) * 8u);
+        out[i] = (uint8_t)((code >> shift) & 0xFFu);
+    }
+    return nbytes;
+}
+
+typedef struct {
+    Storage* storage;
+    uint8_t (*payloads)[RADIOTCHI_DIFF_BYTES_MAX];
+    uint16_t* lens;
+    uint8_t cap;
+    uint8_t count;
+} CollectCtx;
+
+static void collect_payload_row(void* ctx, const char* const* fields, int nf) {
+    CollectCtx* c = ctx;
+    if(c->count >= c->cap || nf < 15) return;
+    const char* sub_ref = fields[14];
+    if(sub_ref[0] == '\0') return; // no lossless `.sub` to re-read
+    Modulation mod = radiotchi_modulation_from_str(fields[3]);
+    uint16_t len =
+        decode_sub_payload(c->storage, sub_ref, mod, c->payloads[c->count], RADIOTCHI_DIFF_BYTES_MAX);
+    if(len == 0) return; // undecodable row: skip (only comparable frames make the diff)
+    c->lens[c->count] = len;
+    c->count++;
+}
+
+uint8_t capture_store_collect_payloads(
+    CaptureStore* store,
+    const char* species_filter,
+    uint8_t payloads[][RADIOTCHI_DIFF_BYTES_MAX],
+    uint16_t* lens,
+    uint8_t cap) {
+    if(store == NULL || payloads == NULL || lens == NULL || cap == 0) return 0;
+    CollectCtx ctx = {store->storage, payloads, lens, cap, 0};
+    capture_store_for_each_row(store, species_filter, collect_payload_row, &ctx);
+    return ctx.count;
+}
+
 // --- re-grade pass ---------------------------------------------------------
 
-// Retroactive VALUES: re-read the lossless `.sub` timing for an OOK capture and try the
-// real PWM decode. The `.sub` is opened READ-ONLY (the lossless invariant is never at
-// risk). On success the event jumps to TIER_VALUES with the named protocol/species.
-static void try_values_from_sub(Storage* storage, const char* sub_path, CaptureEvent* ev) {
+// Read a stored `.sub`'s pulse train (its RAW_Data lines) into `pulses`, READ-ONLY (the
+// lossless invariant is never at risk). Returns the pulse count. Shared by the re-grade
+// (try_values_from_sub) and the diff-learning payload collector.
+static uint16_t read_sub_pulses(Storage* storage, const char* sub_path, int16_t* pulses, uint16_t cap) {
     File* f = storage_file_alloc(storage);
-    int16_t pulses[RADIOTCHI_PULSES_MAX];
     uint16_t pc = 0;
     if(storage_file_open(f, sub_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
         char chunk[256];
         char line[256];
         size_t line_len = 0;
         size_t n;
-        while(pc < RADIOTCHI_PULSES_MAX && (n = storage_file_read(f, chunk, sizeof(chunk))) > 0) {
+        while(pc < cap && (n = storage_file_read(f, chunk, sizeof(chunk))) > 0) {
             for(size_t i = 0; i < n; i++) {
                 char c = chunk[i];
                 if(c == '\n' || line_len >= sizeof(line) - 1) {
                     line[line_len] = '\0';
-                    pc = radiotchi_parse_raw_data(line, pulses, RADIOTCHI_PULSES_MAX, pc);
+                    pc = radiotchi_parse_raw_data(line, pulses, cap, pc);
                     line_len = 0;
-                    if(pc >= RADIOTCHI_PULSES_MAX) break;
+                    if(pc >= cap) break;
                 } else if(c != '\r') {
                     line[line_len++] = c;
                 }
             }
         }
-        if(line_len > 0 && pc < RADIOTCHI_PULSES_MAX) { // a final line with no newline
+        if(line_len > 0 && pc < cap) { // a final line with no newline
             line[line_len] = '\0';
-            pc = radiotchi_parse_raw_data(line, pulses, RADIOTCHI_PULSES_MAX, pc);
+            pc = radiotchi_parse_raw_data(line, pulses, cap, pc);
         }
     }
     storage_file_close(f);
     storage_file_free(f);
+    return pc;
+}
 
+// Retroactive VALUES: re-read the lossless `.sub` timing and run the real decoder for the
+// capture's modulation (OOK PWM / repeating-frame, or the 2FSK sensor demod). On success the
+// event jumps to TIER_VALUES with the family-level protocol/species (never a per-device id).
+static void try_values_from_sub(Storage* storage, const char* sub_path, CaptureEvent* ev) {
+    int16_t pulses[RADIOTCHI_PULSES_MAX];
+    uint16_t pc = read_sub_pulses(storage, sub_path, pulses, RADIOTCHI_PULSES_MAX);
+    if(pc == 0) return;
+
+    if(ev->modulation == MOD_2FSK) {
+        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+        uint16_t flen = 0;
+        if(radiotchi_fsk_sensor_decode(pulses, pc, frame, sizeof(frame), &flen)) {
+            radiotchi_individual_fingerprint_bytes(frame, flen, ev->individual, sizeof(ev->individual));
+            ev->decode_tier = TIER_VALUES;
+            strncpy(ev->protocol, "FSK-Sensor", sizeof(ev->protocol) - 1);
+            ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+            snprintf(
+                ev->species_id, sizeof(ev->species_id), "fsk-sensor-%lu",
+                (unsigned long)(ev->frequency_hz / 1000000u));
+            ev->scores.nourishment = radiotchi_tier_nourishment(TIER_VALUES);
+        }
+        return;
+    }
+
+    // OOK fixed-code: the PWM bit decoder (with a per-device tag), else a confirmed repeating
+    // remote of an encoding we don't bit-decode (VALUES, but no misleading individual).
     uint32_t code = 0;
     uint8_t nbits = 0;
     bool got = false;
-    if(pc > 0 && radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) {
+    if(radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) {
         radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
         got = true;
-    } else if(pc > 0 && radiotchi_repeating_frame(pulses, pc, NULL)) {
-        // Confirmed repeating remote, non-PWM encoding: VALUES but no (misleading) individual.
+    } else if(radiotchi_repeating_frame(pulses, pc, NULL)) {
         got = true; // ev->individual stays as-is (empty for a fresh re-grade)
     }
     if(got) {
@@ -487,8 +598,9 @@ static bool regrade_row(Storage* storage, const char* line, SpeciesIndex* idx, F
     if(nf >= 16) strncpy(ev.individual, fields[15], sizeof(ev.individual) - 1); // preserve existing
 
     radiotchi_redecode(&ev); // signature pass: may raise up to PROTOCOL
-    // Retroactive VALUES: re-read the .sub timing for an OOK capture and really decode.
-    if(ev.decode_tier < TIER_VALUES && ev.modulation == MOD_OOK && fields[14][0] != '\0') {
+    // Retroactive VALUES: re-read the .sub timing for an OOK or 2FSK capture and really decode.
+    if(ev.decode_tier < TIER_VALUES &&
+       (ev.modulation == MOD_OOK || ev.modulation == MOD_2FSK) && fields[14][0] != '\0') {
         try_values_from_sub(storage, fields[14], &ev);
     }
     bool changed = (ev.decode_tier != original);

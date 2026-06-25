@@ -209,9 +209,28 @@ static void test_reversible_morph(void) {
     CHECK(g.type_id != wild_type, "the morph actually changed");
 }
 
+// pet_growth_feed_scaled scales ONLY exp; the stat EMA is identical to a full feed.
+static void test_feed_scaled(void) {
+    printf("feed scaled:\n");
+    CaptureEvent ev = ev_with(0.5f, 0.9f, 0.0f, 1.0f, 1.0f); // a meal worth some exp
+    PetGrowth full, half, plain;
+    pet_growth_init(&full);
+    pet_growth_init(&half);
+    pet_growth_init(&plain);
+    pet_growth_feed_scaled(&full, &ev, 0u, 1u, 1u);
+    pet_growth_feed(&plain, &ev, 0u);
+    pet_growth_feed_scaled(&half, &ev, 0u, 1u, 2u);
+    CHECK(full.total_exp == plain.total_exp, "1/1 scaling == pet_growth_feed");
+    CHECK(full.total_exp > 0u, "the meal grants exp");
+    CHECK(half.total_exp == full.total_exp / 2u, "1/2 scaling halves only the exp");
+    for(int i = 0; i < PET_STAT_COUNT; i++)
+        CHECK(half.stat[i] == full.stat[i], "exp scaling leaves the stat EMA untouched");
+}
+
 int main(void) {
     printf("== Radiotchi pet_growth host tests ==\n");
     test_exp();
+    test_feed_scaled();
     test_level_curve();
     test_type_bijection();
     test_type_resolve();

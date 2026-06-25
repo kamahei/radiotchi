@@ -31,6 +31,10 @@ companion.
   *(`pet_sprites.c` composes the real compiled-in 1-bit parts via `canvas_draw_icon`.)*
 - The pet **animates autonomously**. **MVP: an Idle animation only** (e.g. a gentle 2-frame
   bob/blink); richer autonomous behaviors (wander, react, sleep) come later.
+- **Mood overlay (D33).** The Home pet reflects time-since-last-meal: a small procedural marker
+  (sparkle = content after a delicacy, "…" = hungry, "z" = neglected; nothing for happy/neutral)
+  plus a frame remap (a hungry pet sways sluggishly, a neglected one is listless). No new art —
+  `pet_render_draw_growth_mood` over `pet_mood`. A never-fed/just-fed pet shows nothing.
 - **Any button raises the Command Menu** (§2); Back at rest does nothing (long-press exits).
 
 ### 2. Command Menu (overlay on Home)
@@ -104,7 +108,15 @@ A short sequence triggered by the **Feed** command (§2); no free navigation mid
 - **Base cell is 64×64** (the pet at rest, idle animation). It need not fill the 128-wide
   screen — the resting pet sits in a 64×64 cell, leaving room for the command-menu overlay.
 - **Full-frame animations may use the whole 128×64** (special/autonomous moments later — e.g.
-  an evolution flourish or a big reaction). MVP ships **Idle only**.
+  an evolution flourish or a big reaction). MVP ships **Idle only**, but the eat celebration now
+  has **procedural special effects** (D33): the flash phase reads an `eat_event` bitmask
+  (level-up / evolution / delicacy) to pick its banner ("LEVEL UP!" / "EVOLVED!" / "DELICACY!")
+  and effects — sparkles, plus an evolution frame-shake + expanding burst ring. All drawn with
+  canvas primitives (no new assets), inside the existing `ScreenEatAnim`.
+- **Dex diff-learning (`ScreenDexDiff`, D32).** Right from the captures list aligns this species'
+  decoded frames byte-by-byte and draws one class glyph per position (`S` id / `I` counter /
+  `V` value / `-` absent) — class markers only, never raw bytes (privacy A5). Falls back to a
+  "need ≥2 decoded captures" message.
 - The adult pet is **one monolithic image-generated 1-bit creature** per `family×shape` (25),
   drawn into a 64×64 cell (D22, superseding the earlier layered-parts compose D21); the egg and
   the lineage-tinted child are shared pre-morph sprites. Mood is baked into the art; the 2nd-stat

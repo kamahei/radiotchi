@@ -17,6 +17,7 @@
 #include "analysis_core.h" // private lib (on FAP include path)
 #include "capture_store.h"
 #include "pet_growth.h"
+#include "pet_mood.h"
 #include "pet_render.h"
 #include "species_index.h"
 #include "radiotchi_labels.h"
@@ -37,6 +38,9 @@
 // Dex capture-list view: newest N rows held in RAM.
 #define DEX_CAPTURES_MAX 32u
 #define LIST_VISIBLE_ROWS  4u
+
+// Diff-learning view: how many of a species' captures to align/compare at once.
+#define DEX_DIFF_MAX 8u
 
 // Home command menu (Tamagotchi-style; raised by any button, see ui-spec.md §2).
 // A vertical panel on the RIGHT of the wide screen; Up/Down select, scrolls when
@@ -68,12 +72,18 @@ static const char* const MENU_LABELS[MENU_COUNT] = {"Detail", "Feed", "Dex", "Re
 // Idle animation tick.
 #define ANIM_PERIOD_MS 400u
 
-// Eat-celebration animation: bars/exp tween, then a level-up / evolve flash.
+// Eat-celebration animation: bars/exp tween, then a level-up / evolve / delicacy flash.
 enum { EAT_PHASE_BARS = 0, EAT_PHASE_FLASH };
 #define EAT_BARS_FRAMES  20
 #define EAT_BARS_MS      35u
 #define EAT_FLASH_FRAMES 10
 #define EAT_FLASH_MS     90u
+
+// What this meal triggered (bitmask; drives the flash banner + procedural effects).
+#define EAT_EVT_LEVEL  0x1u // crossed a level boundary
+#define EAT_EVT_EVOLVE 0x2u // the 100-type morph changed (checkpoint re-speciation)
+#define EAT_EVT_RARE   0x4u // a novel / delicacy catch
+#define EAT_RARE_SCORE 0.8f // rarity at/above this counts as a delicacy
 
 typedef enum {
     ScreenHome,
@@ -85,6 +95,7 @@ typedef enum {
     ScreenDexSpecies,
     ScreenDexCaptures,
     ScreenCaptureDetail,
+    ScreenDexDiff,
     ScreenPetDetail,
     ScreenNameEdit,
     ScreenEatAnim,
@@ -111,6 +122,7 @@ typedef struct {
 
     // pet + dex counts
     PetGrowth growth; // 5 stats + EXP/level/100-type morph (drives display + persistence)
+    PetCare care; // last-feed time + meal quality (drives hunger/mood; persisted)
     char name[RADIOTCHI_PET_NAME_CAP];
     uint32_t dex_count;
     int regrade_result; // rows changed by the last dex re-grade (-1 = error)
@@ -120,6 +132,7 @@ typedef struct {
     uint32_t menu_sel;
     uint32_t menu_scroll;
     uint32_t anim_frame;
+    uint32_t now_cache; // RTC seconds, refreshed on the anim tick (mood off the draw path)
 
 #ifdef RADIOTCHI_DEBUG
     // debug character gallery (browse every sprite)
@@ -135,6 +148,7 @@ typedef struct {
     PetGrowth eat_before;
     float eat_t; // 0..1 tween progress
     uint8_t eat_phase; // EAT_PHASE_BARS | EAT_PHASE_FLASH
+    uint8_t eat_event; // EAT_EVT_* bitmask for the flash phase
 
     // detection tuning + last-sweep diagnostics
     int16_t threshold;
@@ -154,6 +168,10 @@ typedef struct {
     uint32_t capture_count;
     uint32_t capture_sel;
     uint32_t capture_scroll;
+
+    // diff-learning view: byte classes across the species' decoded captures
+    ByteDiff diff;
+    uint8_t diff_count; // frames compared (0/1 => "need >= 2 decoded")
 } AppModel;
 
 typedef struct {
@@ -248,7 +266,9 @@ static void captures_row_text(void* ctx, uint32_t i, char* out, size_t out_len) 
 // menu is open the pet shifts left to make room for the right-side panel.
 static void draw_home(Canvas* canvas, const AppModel* m) {
     int cx = m->menu_open ? 38 : 64;
-    pet_render_draw_growth(canvas, &m->growth, cx, 30, m->anim_frame);
+    PetMood mood = pet_mood(&m->care, m->now_cache);
+    pet_render_draw_growth_mood(
+        canvas, &m->growth, mood, cx, 30, pet_mood_anim_frame(mood, m->anim_frame));
     if(!m->menu_open) {
         // A faint hint that a button opens the menu; no chrome otherwise.
         canvas_set_font(canvas, FontSecondary);
@@ -425,8 +445,60 @@ static void draw_detail(Canvas* canvas, const AppModel* m) {
     canvas_draw_str(canvas, 2, 55, line);
 }
 
+// Diff-learning view: one class glyph per byte position across this species' decoded captures.
+// S=static (an id/fixed field), I=incrementing (a rolling counter), V=varying (a sensor value),
+// -=absent. Privacy (A5): only the CLASS is drawn, never the raw byte value.
+static void draw_diff(Canvas* canvas, const AppModel* m) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 11, "Learning");
+    canvas_set_font(canvas, FontSecondary);
+
+    char head[28];
+    snprintf(head, sizeof(head), "%.15s x%u", m->browse_species, (unsigned)m->diff_count);
+    canvas_draw_str(canvas, 2, 21, head);
+
+    if(m->diff_count < 2 || m->diff.width == 0) {
+        canvas_draw_str(canvas, 2, 36, "Need >=2 decoded");
+        canvas_draw_str(canvas, 2, 46, "captures to compare");
+        canvas_draw_str(canvas, 2, 62, "Back: captures");
+        return;
+    }
+
+    const int per_row = 16;
+    for(uint16_t p = 0; p < m->diff.width && p < RADIOTCHI_DIFF_BYTES_MAX; p++) {
+        int x = 4 + (int)(p % per_row) * 7;
+        int y = 33 + (int)(p / per_row) * 9;
+        char g;
+        switch(m->diff.cls[p]) {
+        case BYTE_STATIC: g = 'S'; break;
+        case BYTE_INCREMENTING: g = 'I'; break;
+        case BYTE_VARYING: g = 'V'; break;
+        default: g = '-'; break;
+        }
+        char s[2] = {g, '\0'};
+        canvas_draw_str(canvas, x, y, s);
+    }
+
+    canvas_draw_str(canvas, 2, 62, "S:id I:cnt V:val");
+}
+
 static float lerpf(float a, float b, float t) {
     return a + (b - a) * t;
+}
+
+// N procedural twinkle sparkles on a fixed pseudo-pattern keyed by `frame` (no art assets).
+static void draw_sparkles(Canvas* canvas, uint32_t frame, int n) {
+    static const uint8_t PX[8][2] = {
+        {28, 30}, {100, 28}, {92, 52}, {18, 46}, {110, 40}, {40, 20}, {72, 54}, {54, 24}};
+    for(int i = 0; i < n && i < 8; i++) {
+        if(((frame + (uint32_t)i) & 1u) == 0) continue; // twinkle on alternating frames
+        int px = PX[i][0], py = PX[i][1];
+        canvas_draw_dot(canvas, px, py);
+        canvas_draw_dot(canvas, px - 1, py);
+        canvas_draw_dot(canvas, px + 1, py);
+        canvas_draw_dot(canvas, px, py - 1);
+        canvas_draw_dot(canvas, px, py + 1);
+    }
 }
 
 // Eat celebration: bars/exp tween from eat_before -> growth (pet hops), then a
@@ -437,20 +509,34 @@ static void draw_eat_anim(Canvas* canvas, const AppModel* m) {
     const PetGrowth* b = &m->growth;
 
     if(m->eat_phase == EAT_PHASE_FLASH) {
-        bool evolved = (a->type_id != b->type_id);
+        uint8_t evt = m->eat_event;
         bool on = (m->anim_frame & 1u) != 0;
-        int hop = on ? -3 : 0;
-        pet_render_draw_growth(canvas, b, 64, 42 + hop, m->anim_frame);
+
+        // EVOLVE shakes the pet ±2px; lesser events just hop.
+        int sx = 0, sy = on ? -3 : 0;
+        if(evt & EAT_EVT_EVOLVE) {
+            static const int8_t SH[4][2] = {{-2, 0}, {2, -1}, {-1, 2}, {2, 1}};
+            sx = SH[m->anim_frame & 3u][0];
+            sy = SH[m->anim_frame & 3u][1];
+        }
+        pet_render_draw_growth(canvas, b, 64 + sx, 42 + sy, m->anim_frame);
+
+        // Evolution burst: a ring expanding over the first few frames.
+        if((evt & EAT_EVT_EVOLVE) && m->anim_frame < 6u) {
+            canvas_draw_circle(canvas, 64, 42, 8 + (int)(m->anim_frame * 4u));
+        }
+
         if(on) canvas_draw_box(canvas, 0, 0, 128, 16);
         canvas_set_color(canvas, on ? ColorWhite : ColorBlack);
         canvas_set_font(canvas, FontPrimary);
-        canvas_draw_str_aligned(
-            canvas, 64, 8, AlignCenter, AlignCenter, evolved ? "EVOLVED!" : "LEVEL UP!");
+        const char* banner = (evt & EAT_EVT_EVOLVE) ? "EVOLVED!" :
+                             (evt & EAT_EVT_LEVEL)  ? "LEVEL UP!" :
+                                                      "DELICACY!";
+        canvas_draw_str_aligned(canvas, 64, 8, AlignCenter, AlignCenter, banner);
         canvas_set_color(canvas, ColorBlack);
         if(on) {
-            canvas_draw_dot(canvas, 28, 30);
-            canvas_draw_dot(canvas, 100, 28);
-            canvas_draw_dot(canvas, 92, 52);
+            int nspark = (evt & EAT_EVT_EVOLVE) ? 6 : (evt & EAT_EVT_LEVEL) ? 4 : 3;
+            draw_sparkles(canvas, m->anim_frame, nspark);
         }
         return;
     }
@@ -645,10 +731,15 @@ static void draw_callback(Canvas* canvas, void* ctx) {
             snprintf(title, sizeof(title), "Captures");
         canvas_draw_str(canvas, 2, 11, title);
         draw_scroll_list(canvas, m->capture_count, m->capture_sel, m->capture_scroll, captures_row_text, app);
+        canvas_set_font(canvas, FontSecondary);
+        canvas_draw_str(canvas, 78, 11, "R:learn"); // Right opens the diff-learning view
         break;
     }
     case ScreenCaptureDetail:
         draw_detail(canvas, m);
+        break;
+    case ScreenDexDiff:
+        draw_diff(canvas, m);
         break;
 #ifdef RADIOTCHI_DEBUG
     case ScreenDebugGallery:
@@ -703,6 +794,7 @@ static void anim_timer_callback(void* ctx) {
     RadiotchiApp* app = ctx;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     app->model.anim_frame++;
+    app->model.now_cache = capture_store_now(); // keep the RTC read off the locked draw path
     furi_mutex_release(app->mutex);
     view_port_update(app->view_port);
 }
@@ -772,9 +864,6 @@ static void do_feed(RadiotchiApp* app) {
 // `before` to the new growth (pet hops), then a level-up / evolve flash. Blocks
 // input briefly (intended); queued keys are drained by the caller afterward.
 static void play_eat_animation(RadiotchiApp* app, const PetGrowth* before) {
-    bool leveled = app->model.growth.level > before->level;
-    bool evolved = app->model.growth.type_id != before->type_id;
-
     for(int f = 0; f <= EAT_BARS_FRAMES; f++) {
         furi_mutex_acquire(app->mutex, FuriWaitForever);
         app->model.eat_before = *before;
@@ -786,7 +875,8 @@ static void play_eat_animation(RadiotchiApp* app, const PetGrowth* before) {
         furi_delay_ms(EAT_BARS_MS);
     }
 
-    if(leveled || evolved) {
+    // Flash on any notable event: level-up, evolution, or a delicacy/novel catch.
+    if(app->model.eat_event != 0u) {
         for(int f = 0; f < EAT_FLASH_FRAMES; f++) {
             furi_mutex_acquire(app->mutex, FuriWaitForever);
             app->model.eat_phase = EAT_PHASE_FLASH;
@@ -812,13 +902,30 @@ static void do_eat(RadiotchiApp* app) {
     species_index_save(app->index);
 
     // Growth layer: snapshot the pre-meal state, feed (5 stats EMA + EXP/level +
-    // 100-type re-derivation), then persist.
+    // 100-type re-derivation), record the meal for hunger/mood, then persist. A neglected
+    // pet's meal grants reduced exp (computed from the PRE-meal care state); only the exp
+    // term is softened — the reversible stat EMA is untouched.
     PetGrowth before = app->model.growth;
-    pet_growth_feed(&app->model.growth, &app->model.ev, app->pending_seen_count);
-    capture_store_save_growth(app->store, &app->model.growth, app->model.name);
+    uint32_t raw_gain = pet_growth_exp_gain(&app->model.ev, app->pending_seen_count);
+    uint32_t adj_gain =
+        pet_mood_apply_exp_pressure(raw_gain, &app->model.care, app->model.ev.timestamp);
+    pet_growth_feed_scaled(
+        &app->model.growth, &app->model.ev, app->pending_seen_count, adj_gain,
+        raw_gain ? raw_gain : 1u);
+    pet_care_feed(&app->model.care, &app->model.ev, app->model.ev.timestamp);
+    capture_store_save_growth(app->store, &app->model.growth, &app->model.care, app->model.name);
+
+    // What to celebrate: level-up, evolution (morph changed), and/or a delicacy/novel catch.
+    uint8_t evt = 0u;
+    if(app->model.growth.level > before.level) evt |= EAT_EVT_LEVEL;
+    if(app->model.growth.type_id != before.type_id) evt |= EAT_EVT_EVOLVE;
+    if(app->pending_seen_count == 0u || app->model.ev.scores.rarity >= EAT_RARE_SCORE)
+        evt |= EAT_EVT_RARE;
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     app->model.dex_count = species_index_count(app->index);
+    app->model.now_cache = app->model.ev.timestamp; // mood reflects the fresh meal at once
+    app->model.eat_event = evt;
     furi_mutex_release(app->mutex);
 
     FURI_LOG_I(
@@ -859,7 +966,7 @@ static void commit_name(RadiotchiApp* app) {
     for(int i = (int)strlen(app->model.name) - 1; i >= 0 && app->model.name[i] == ' '; i--)
         app->model.name[i] = '\0';
     furi_mutex_release(app->mutex);
-    capture_store_save_growth(app->store, &app->model.growth, app->model.name);
+    capture_store_save_growth(app->store, &app->model.growth, &app->model.care, app->model.name);
 }
 
 // ========================= dex read ======================================
@@ -873,6 +980,7 @@ typedef struct {
 } DexCollectCtx;
 
 static void open_captures_for_selected(RadiotchiApp* app);
+static void open_diff_for_selected(RadiotchiApp* app);
 
 // ========================= input routing ===================================
 
@@ -1097,6 +1205,8 @@ static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* runnin
             // Detail uses the currently-loaded ev (last captured). For older rows
             // a full re-load from .sub is post-MVP; show the live ev fields.
             set_screen(app, ScreenCaptureDetail);
+        } else if(key == InputKeyRight && type == InputTypeShort && count > 0) {
+            open_diff_for_selected(app); // align this species' frames byte-by-byte
         } else if(key == InputKeyBack && type == InputTypeShort) {
             set_screen(app, ScreenDexSpecies);
         }
@@ -1104,6 +1214,10 @@ static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* runnin
     }
 
     case ScreenCaptureDetail:
+        if(key == InputKeyBack && type == InputTypeShort) set_screen(app, ScreenDexCaptures);
+        break;
+
+    case ScreenDexDiff:
         if(key == InputKeyBack && type == InputTypeShort) set_screen(app, ScreenDexCaptures);
         break;
 
@@ -1168,14 +1282,18 @@ static RadiotchiApp* radiotchi_app_alloc(void) {
     cfg.detection_margin_db = t.detection_margin_db;
     if(app->capture) subghz_capture_source_set_config(app->capture, cfg);
 
-    // Load the growth layer + name, or start a fresh Unformed pet named "Radiotchi".
+    // Load the growth layer + care + name, or start a fresh Unformed pet named "Radiotchi".
+    // (load_growth always seeds care to never-fed grace, so a fresh or pre-care pet is safe.)
     if(!app->store ||
        !capture_store_load_growth(
-           app->store, &app->model.growth, app->model.name, RADIOTCHI_PET_NAME_CAP)) {
+           app->store, &app->model.growth, &app->model.care, app->model.name,
+           RADIOTCHI_PET_NAME_CAP)) {
         pet_growth_init(&app->model.growth);
+        pet_care_init(&app->model.care);
         strncpy(app->model.name, "Radiotchi", RADIOTCHI_PET_NAME_CAP - 1);
     }
     if(app->model.name[0] == '\0') strncpy(app->model.name, "Radiotchi", RADIOTCHI_PET_NAME_CAP - 1);
+    app->model.now_cache = capture_store_now(); // seed mood time before the first draw
 
     app->view_port = view_port_alloc();
     view_port_draw_callback_set(app->view_port, draw_callback, app);
@@ -1272,4 +1390,24 @@ static void open_captures_for_selected(RadiotchiApp* app) {
     capture_store_for_each_row(app->store, app->model.browse_species, dex_collect_row, &ctx);
 
     set_screen(app, ScreenDexCaptures);
+}
+
+// Diff-learning: re-read this species' captures from their `.sub`, decode each to a frame, and
+// classify byte positions (id / counter / value). Heavy I/O + decode run UNLOCKED (mirrors
+// do_regrade); only the small ByteDiff result is published under the lock.
+static void open_diff_for_selected(RadiotchiApp* app) {
+    uint8_t payloads[DEX_DIFF_MAX][RADIOTCHI_DIFF_BYTES_MAX];
+    uint16_t lens[DEX_DIFF_MAX];
+    uint8_t count = capture_store_collect_payloads(
+        app->store, app->model.browse_species, payloads, lens, DEX_DIFF_MAX);
+
+    const uint8_t* ptrs[DEX_DIFF_MAX];
+    for(uint8_t i = 0; i < count; i++) ptrs[i] = payloads[i];
+    ByteDiff diff = radiotchi_byte_diff(ptrs, lens, count);
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    app->model.diff = diff;
+    app->model.diff_count = count;
+    furi_mutex_release(app->mutex);
+    set_screen(app, ScreenDexDiff);
 }

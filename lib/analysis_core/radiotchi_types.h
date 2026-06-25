@@ -30,6 +30,14 @@ extern "C" {
 // this is a working prefix (a few frames is plenty for a fixed-code).
 #define RADIOTCHI_PULSES_MAX 256u
 
+// Max bytes of a demodulated FSK-sensor frame the value decoder packs (a sensor
+// packet is small; the lossless original stays the `.sub`).
+#define RADIOTCHI_FSK_FRAME_MAX 16u
+
+// Max byte positions classified by the diff-learning view (one `id-XXXX`'s frames
+// aligned column-by-column). Frames of these families are small; 32 is ample.
+#define RADIOTCHI_DIFF_BYTES_MAX 32u
+
 // Field widths for the small fixed strings crossing the boundary.
 #define RADIOTCHI_SUBREF_LEN     64u
 #define RADIOTCHI_PROTOCOL_LEN   32u
@@ -112,6 +120,24 @@ typedef struct {
     // (VALUES). A one-way hash of the code — never the raw persistent identifier (A5).
     char individual[RADIOTCHI_INDIVIDUAL_LEN];
 } CaptureEvent;
+
+// Per-byte classification of N aligned decoded frames (the diff-learning view). A
+// DERIVED, non-persisted result of radiotchi_byte_diff — not a cross-layer boundary
+// type. Privacy (A5): callers render the CLASS markers, never the raw byte values, so
+// the view teaches "which byte is the id / counter / sensor value" without surfacing the
+// trackable id itself.
+typedef enum {
+    BYTE_STATIC = 0, // identical across all frames => an identifier / fixed field
+    BYTE_INCREMENTING, // constant non-zero step (mod 256) => a rolling counter
+    BYTE_VARYING, // changes without a constant step => a sensor value / payload
+    BYTE_ABSENT, // beyond the shortest frame (ragged lengths)
+} ByteClass;
+
+typedef struct {
+    uint16_t width; // byte positions classified (0 if < 2 frames given)
+    uint8_t count; // number of frames compared
+    ByteClass cls[RADIOTCHI_DIFF_BYTES_MAX];
+} ByteDiff;
 
 #ifdef __cplusplus
 }

@@ -92,6 +92,37 @@ uint16_t radiotchi_parse_raw_data(const char* line, int16_t* out, uint16_t cap, 
 // species stays at the family/protocol granularity.
 bool radiotchi_ook_pwm_decode(const int16_t* pulses, uint16_t n, uint32_t* code, uint8_t* nbits);
 
+// Demodulate a structured 2FSK sensor frame (the weather/telemetry/TPMS PCM/NRZ class)
+// from a signed pulse train (+mark / -space µs, the firmware's async-RAW slicer output).
+// The bit period is the robust-minimum run; each run expands to round(dur/period) NRZ bits
+// (mark=1, space=0); frames are split at the long inter-frame gap. As with the OOK decoder,
+// a frame is trusted only when an immediately-following repeat packs the SAME bytes (real
+// sensors retransmit; ambient noise does not) — so noise cannot fake a frame. On success
+// writes the packed frame bytes (MSB-first, up to `cap`) and their byte length. Scoped to
+// the PCM/NRZ-with-repeat subclass; other FSK framings fall back to the signature PROTOCOL
+// tier (never a regression). Pure.
+//
+// Note (privacy, A5): the frame proves we read the values (raising the tier); callers MUST
+// NOT surface its bytes as a trackable per-device identifier — the dex species stays at the
+// family granularity; only the one-way hashed tag below crosses to the dex.
+bool radiotchi_fsk_sensor_decode(
+    const int16_t* pulses, uint16_t n, uint8_t* frame, uint16_t cap, uint16_t* frame_len);
+
+// Privacy-safe individual fingerprint of a multi-byte decoded frame: a short ONE-WAY hash
+// ("id-XXXX") of (bytes, length). Same role/format as radiotchi_individual_fingerprint but
+// for the byte-frame decoders (FSK): repeated captures of the same device share a stable tag
+// for local longitudinal learning, while the raw frame cannot be recovered from it (A5).
+// Writes a NUL-terminated tag into `out`. Pure.
+void radiotchi_individual_fingerprint_bytes(
+    const uint8_t* frame, uint16_t len, char* out, size_t out_len);
+
+// Align N decoded payloads byte-by-byte and classify each position as STATIC (an id/fixed
+// field), INCREMENTING (a rolling counter), VARYING (a sensor value) or ABSENT (beyond the
+// shortest frame). Deterministic, integer-only; the foundation of the diff-learning dex view.
+// `payloads[i]` has `lens[i]` bytes. With `count` < 2 the result has width 0. Pure — the
+// caller renders only the resulting class markers, never the raw bytes (A5).
+ByteDiff radiotchi_byte_diff(const uint8_t* const* payloads, const uint16_t* lens, uint8_t count);
+
 // Encoding-AGNOSTIC path to VALUES: detect a CONFIRMED repeating fixed transmission by
 // finding >= 2 identical quantized frames in the pulse train. A real remote retransmits a
 // fixed frame several times per press (so frames match), while ambient noise does not repeat

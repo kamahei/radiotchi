@@ -67,6 +67,28 @@ static uint16_t build_pwm_frame(
     return at;
 }
 
+// Append an NRZ run-length frame for `nbits` of `bytes` (MSB-first), coalescing equal
+// consecutive bits into one run of (count * period) µs (sign + for a 1, - for a 0), then a
+// long inter-frame gap. Mirrors how the firmware async-RAW slicer emits a 2FSK PCM frame.
+static uint16_t build_fsk_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, uint16_t nbits, int16_t period, int16_t gap) {
+    int run = 0;
+    int cur = -1;
+    for(uint16_t b = 0; b < nbits; b++) {
+        int bit = (bytes[b >> 3] >> (7 - (b & 7))) & 1;
+        if(bit == cur) {
+            run++;
+        } else {
+            if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)period);
+            cur = bit;
+            run = 1;
+        }
+    }
+    if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)period);
+    out[at++] = (int16_t)(-gap);
+    return at;
+}
+
 // --- entropy ---------------------------------------------------------------
 
 static void test_entropy(void) {
@@ -569,6 +591,203 @@ static void test_fw_decode(void) {
     CHECK(ev.scores.nourishment == 1.0f, "VALUES => full nourishment");
 }
 
+// --- real 2FSK sensor demodulation (TIER_VALUES) ----------------------------
+
+static void test_fsk_decode(void) {
+    printf("fsk decode:\n");
+    const uint8_t want[3] = {0xAA, 0xC5, 0x3D};
+    int16_t buf[256];
+    uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen = 0;
+
+    // Two identical NRZ frames (a sensor retransmits) => decode the exact bytes.
+    uint16_t n = build_fsk_frame(buf, 0, want, 24, 100, 8000);
+    n = build_fsk_frame(buf, n, want, 24, 100, 8000);
+    CHECK(radiotchi_fsk_sensor_decode(buf, n, frame, sizeof(frame), &flen), "two FSK frames decode");
+    CHECK(flen == 3, "recovers the 3-byte frame length");
+    CHECK(frame[0] == 0xAA && frame[1] == 0xC5 && frame[2] == 0x3D, "recovers the exact frame bytes");
+
+    // Determinism: decoding the same train twice yields identical bytes (idempotent re-grade).
+    uint8_t frame2[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen2 = 0;
+    radiotchi_fsk_sensor_decode(buf, n, frame2, sizeof(frame2), &flen2);
+    CHECK(flen == flen2 && memcmp(frame, frame2, flen) == 0, "decode is deterministic");
+
+    // A lone (un-repeated) frame is rejected — the noise guard (real sensors retransmit).
+    uint16_t one = build_fsk_frame(buf, 0, want, 24, 100, 8000);
+    CHECK(
+        !radiotchi_fsk_sensor_decode(buf, one, frame, sizeof(frame), &flen),
+        "a single un-repeated frame is rejected");
+
+    // Two frames that DISAGREE => distrust.
+    const uint8_t other[3] = {0xAA, 0xC5, 0x3C};
+    n = build_fsk_frame(buf, 0, want, 24, 100, 8000);
+    n = build_fsk_frame(buf, n, other, 24, 100, 8000);
+    CHECK(
+        !radiotchi_fsk_sensor_decode(buf, n, frame, sizeof(frame), &flen),
+        "disagreeing repeat frames are distrusted");
+
+    // A different bit period round-trips to the same bytes (the period is estimated, not assumed).
+    n = build_fsk_frame(buf, 0, want, 24, 200, 12000);
+    n = build_fsk_frame(buf, n, want, 24, 200, 12000);
+    CHECK(
+        radiotchi_fsk_sensor_decode(buf, n, frame, sizeof(frame), &flen) && flen == 3 &&
+            frame[0] == 0xAA && frame[1] == 0xC5 && frame[2] == 0x3D,
+        "decodes with a different bit period");
+
+    // A sub-glitch spike inside the frame is ignored (does not corrupt the bitstream).
+    int16_t gbuf[300];
+    uint16_t gn = build_fsk_frame(gbuf, 0, want, 24, 100, 8000);
+    for(uint16_t k = gn; k > 1; k--) gbuf[k] = gbuf[k - 1]; // open a slot at index 1
+    gbuf[1] = 20; // < WV_FSK_GLITCH_US
+    gn += 1;
+    gn = build_fsk_frame(gbuf, gn, want, 24, 100, 8000);
+    CHECK(
+        radiotchi_fsk_sensor_decode(gbuf, gn, frame, sizeof(frame), &flen) && flen == 3 &&
+            frame[0] == 0xAA,
+        "a sub-glitch spike is ignored");
+}
+
+static void test_fsk_values(void) {
+    printf("fsk values tier:\n");
+    const uint8_t want[3] = {0xAA, 0xC5, 0x3D};
+    int16_t buf[256];
+    uint16_t n = build_fsk_frame(buf, 0, want, 24, 100, 8000);
+    n = build_fsk_frame(buf, n, want, 24, 100, 8000);
+
+    RawCapture r;
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 868350000u;
+    r.rssi_dbm = -55;
+    r.modulation = MOD_2FSK;
+    r.bit_count = 24; // a real burst length (so the no-timing path still reaches PROTOCOL)
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev = analyze_capture(&r, NULL, 1);
+    CHECK(ev.decode_tier == TIER_VALUES, "decoded 2FSK frame reaches TIER_VALUES");
+    CHECK(strcmp(ev.protocol, "FSK-Sensor") == 0, "names the FSK-Sensor family");
+    CHECK(ev.scores.nourishment == 1.0f, "VALUES tier => full nourishment");
+    // Privacy (A5): the species stays family-level (band), never the decoded frame.
+    CHECK(strcmp(ev.species_id, "fsk-sensor-868") == 0, "species is family-level, not the frame");
+    CHECK(strncmp(ev.individual, "id-", 3) == 0, "VALUES sets a privacy-safe individual tag");
+
+    // SAME signal WITHOUT the pulse train => signature classifier only => PROTOCOL.
+    r.pulse_count = 0;
+    CaptureEvent ev2 = analyze_capture(&r, NULL, 1);
+    CHECK(ev2.decode_tier == TIER_PROTOCOL, "no timing => 2FSK stops at PROTOCOL");
+    CHECK(ev2.individual[0] == '\0', "no frame decoded => no individual tag");
+}
+
+static void test_fsk_fixture_sub(void) {
+    printf("fsk fixture .sub:\n");
+    FILE* fp = fopen("../fixtures/synthetic/structured_fsk_868.sub", "r");
+    if(fp == NULL) fp = fopen("fixtures/synthetic/structured_fsk_868.sub", "r");
+    if(fp == NULL) {
+        printf("  (skip: fixture not reachable from cwd)\n");
+        return;
+    }
+    int16_t pulses[256];
+    uint16_t n = 0;
+    char line[2048];
+    while(n < 256 && fgets(line, sizeof(line), fp) != NULL) {
+        n = radiotchi_parse_raw_data(line, pulses, 256, n);
+    }
+    fclose(fp);
+
+    uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen = 0;
+    CHECK(n > 0, "parsed pulses from the on-disk FSK fixture");
+    CHECK(radiotchi_fsk_sensor_decode(pulses, n, frame, sizeof(frame), &flen), "the FSK fixture decodes");
+    CHECK(
+        flen == 3 && frame[0] == 0xAA && frame[1] == 0xC5 && frame[2] == 0x3D,
+        "the FSK fixture yields AA C5 3D");
+}
+
+// Regression: ambient noise (no transmitter) must NOT decode to a false FSK frame either.
+static void test_fsk_noise_gate(void) {
+    printf("fsk noise gate:\n");
+    FILE* fp = fopen("../fixtures/real/noise_868.sub", "r");
+    if(fp == NULL) fp = fopen("fixtures/real/noise_868.sub", "r");
+    if(fp == NULL) {
+        printf("  (skip: fixture not reachable from cwd)\n");
+        return;
+    }
+    int16_t pulses[RADIOTCHI_PULSES_MAX];
+    uint16_t n = 0;
+    char line[4096];
+    while(n < RADIOTCHI_PULSES_MAX && fgets(line, sizeof(line), fp) != NULL) {
+        n = radiotchi_parse_raw_data(line, pulses, RADIOTCHI_PULSES_MAX, n);
+    }
+    fclose(fp);
+
+    uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen = 0;
+    CHECK(n > 0, "parsed pulses from the real noise capture");
+    CHECK(
+        !radiotchi_fsk_sensor_decode(pulses, n, frame, sizeof(frame), &flen),
+        "real ambient noise does NOT decode to a (false) FSK frame");
+}
+
+static void test_individual_fingerprint_bytes(void) {
+    printf("individual fingerprint (bytes):\n");
+    const uint8_t a_frame[3] = {0xAA, 0xC5, 0x3D};
+    const uint8_t b_frame[3] = {0xAA, 0xC5, 0x3C};
+    char a[RADIOTCHI_INDIVIDUAL_LEN], b[RADIOTCHI_INDIVIDUAL_LEN], c[RADIOTCHI_INDIVIDUAL_LEN];
+    radiotchi_individual_fingerprint_bytes(a_frame, 3, a, sizeof(a));
+    radiotchi_individual_fingerprint_bytes(a_frame, 3, b, sizeof(b)); // same frame, same tag
+    radiotchi_individual_fingerprint_bytes(b_frame, 3, c, sizeof(c)); // different frame
+    CHECK(strcmp(a, b) == 0, "same frame => stable tag (recurrence is observable)");
+    CHECK(strcmp(a, c) != 0, "a different frame => a different tag");
+    CHECK(strncmp(a, "id-", 3) == 0, "tag is the id- form");
+    // Length is folded in: same leading bytes, different length => different tag.
+    radiotchi_individual_fingerprint_bytes(a_frame, 2, c, sizeof(c));
+    CHECK(strcmp(a, c) != 0, "frame length disambiguates a shared prefix");
+}
+
+// --- diff-learning byte classifier ------------------------------------------
+
+static void test_byte_diff(void) {
+    printf("byte diff:\n");
+    // STATIC: identical payloads => every byte is an identifier/fixed field.
+    const uint8_t s0[4] = {0x11, 0x22, 0x33, 0x44};
+    const uint8_t s1[4] = {0x11, 0x22, 0x33, 0x44};
+    const uint8_t s2[4] = {0x11, 0x22, 0x33, 0x44};
+    const uint8_t* sp[3] = {s0, s1, s2};
+    uint16_t sl[3] = {4, 4, 4};
+    ByteDiff ds = radiotchi_byte_diff(sp, sl, 3);
+    CHECK(ds.width == 4 && ds.count == 3, "static: 4 positions over 3 frames");
+    CHECK(ds.cls[0] == BYTE_STATIC && ds.cls[3] == BYTE_STATIC, "identical bytes => STATIC");
+
+    // INCREMENTING (incl. uint8 wrap) vs VARYING in one set.
+    const uint8_t i0[3] = {0x10, 0xFE, 0x20};
+    const uint8_t i1[3] = {0x11, 0xFF, 0x55};
+    const uint8_t i2[3] = {0x12, 0x00, 0x33};
+    const uint8_t* ip[3] = {i0, i1, i2};
+    uint16_t il[3] = {3, 3, 3};
+    ByteDiff di = radiotchi_byte_diff(ip, il, 3);
+    CHECK(di.cls[0] == BYTE_INCREMENTING, "constant +1 step => INCREMENTING");
+    CHECK(di.cls[1] == BYTE_INCREMENTING, "0xFE,0xFF,0x00 wraps cleanly => INCREMENTING");
+    CHECK(di.cls[2] == BYTE_VARYING, "no constant step => VARYING");
+
+    // ABSENT: ragged lengths => positions past the shortest frame are absent.
+    const uint8_t r0[2] = {0xAB, 0xCD};
+    const uint8_t r1[4] = {0xAB, 0xCD, 0xEF, 0x01};
+    const uint8_t* rp[2] = {r0, r1};
+    uint16_t rl[2] = {2, 4};
+    ByteDiff dr = radiotchi_byte_diff(rp, rl, 2);
+    CHECK(dr.width == 4, "width spans the longest frame");
+    CHECK(dr.cls[0] == BYTE_STATIC, "the shared prefix is classified normally");
+    CHECK(dr.cls[2] == BYTE_ABSENT && dr.cls[3] == BYTE_ABSENT, "bytes past the shortest => ABSENT");
+
+    // Fewer than 2 frames => empty diff.
+    ByteDiff d1 = radiotchi_byte_diff(sp, sl, 1);
+    CHECK(d1.width == 0, "a single frame has no diff");
+
+    // Determinism: same inputs => byte-identical result.
+    ByteDiff a = radiotchi_byte_diff(ip, il, 3);
+    ByteDiff b = radiotchi_byte_diff(ip, il, 3);
+    CHECK(memcmp(&a, &b, sizeof(ByteDiff)) == 0, "byte diff is deterministic");
+}
+
 int main(void) {
     printf("== Radiotchi analysis_core host tests ==\n");
     test_entropy();
@@ -588,6 +807,12 @@ int main(void) {
     test_fw_decode();
     test_individual_fingerprint();
     test_values_tier();
+    test_fsk_decode();
+    test_fsk_values();
+    test_fsk_fixture_sub();
+    test_fsk_noise_gate();
+    test_individual_fingerprint_bytes();
+    test_byte_diff();
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
