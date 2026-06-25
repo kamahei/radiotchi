@@ -17,6 +17,7 @@
 #include "radiotchi_types.h"
 #include "pet_growth.h"
 #include "pet_mood.h" // PetCare (persisted alongside the growth layer)
+#include "pet_quests.h" // PetQuests (persisted alongside the growth layer)
 
 #ifdef __cplusplus
 extern "C" {
@@ -33,6 +34,8 @@ typedef struct SpeciesIndex SpeciesIndex; // opaque; full type in species_index.
 typedef struct {
     int16_t rssi_threshold_dbm;
     int16_t detection_margin_db;
+    uint8_t sound_enabled; // feed/eat/milestone sound cues (default OFF; back-compat default OFF)
+    uint8_t vibro_enabled; // haptic cues on milestones (default OFF; back-compat default OFF)
 } CaptureTuning;
 
 // Open the store (acquires the Storage record, ensures directories exist).
@@ -55,15 +58,20 @@ bool capture_store_load_tuning(CaptureStore* store, CaptureTuning* out);
 void capture_store_save_tuning(CaptureStore* store, const CaptureTuning* tuning);
 
 // Load/save the growth layer (5 stats + EXP/level/type), the care/mood state (last-feed
-// time + meal quality), and the user-given name. Stats are centi-units; `name` is copied up
-// to `name_cap` (incl. NUL). `care` may be NULL (then it is not loaded/saved). load returns
-// false if no growth file exists yet (caller keeps init defaults). Back-compat: a pre-care
-// growth.txt loads its growth+name unchanged and leaves *care at pet_care_init() (never-fed
-// grace), so upgrading an existing pet does not punish it for pre-feature idle time.
+// time + meal quality), the quest/streak progress, and the user-given name. Stats are
+// centi-units; `name` is copied up to `name_cap` (incl. NUL). `care` and `quests` may be NULL
+// (then they are not loaded/saved). load returns false if no growth file exists yet (caller
+// keeps init defaults). Back-compat: a pre-care / pre-quest growth.txt loads its growth+name
+// unchanged and leaves *care at pet_care_init() (never-fed grace) and *quests at
+// pet_quests_init() (no progress), so upgrading an existing pet never punishes it or loses data.
 bool capture_store_load_growth(
-    CaptureStore* store, PetGrowth* out, PetCare* care, char* name, size_t name_cap);
+    CaptureStore* store, PetGrowth* out, PetCare* care, PetQuests* quests, char* name, size_t name_cap);
 void capture_store_save_growth(
-    CaptureStore* store, const PetGrowth* g, const PetCare* care, const char* name);
+    CaptureStore* store,
+    const PetGrowth* g,
+    const PetCare* care,
+    const PetQuests* quests,
+    const char* name);
 
 // Stream the append-only capture log. `cb` is called once per data row (header
 // skipped) with the split CSV fields; if `species_filter` is non-NULL, only rows

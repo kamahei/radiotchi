@@ -22,6 +22,11 @@ are deliberately deferred **until real RF data is collected** (recon, Phase 0 of
 
 - **Decided & kept** (not open): encrypted = junk (common) / rare = delicacy. See
   [decision-log.md](decision-log.md) D1.
+- **Quest / feedback calibration (D35)** — the achievement thresholds (`QUEST_*_N` in
+  `pet_quests.h`: 10 meals, 5 species, streak 3/7) and the sound/vibro **cue set** in
+  `pet_feedback.c` are PROVISIONAL like the care/mood constants (Q9 family); the *behaviour*
+  (streaks count on-time meals within `PET_NEGLECT_SECS`, achievements latch once earned) is the
+  contract. Tune after a feed-cadence playtest. Sound and vibration both **default OFF**.
 - When resolving any question above, move the outcome into [decision-log.md](decision-log.md)
   and update the affected docs ([data-model.md](data-model.md),
   [product-spec.md](product-spec.md), [acceptance-criteria.md](acceptance-criteria.md)) in the

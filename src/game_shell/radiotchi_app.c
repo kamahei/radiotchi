@@ -18,6 +18,8 @@
 #include "capture_store.h"
 #include "pet_growth.h"
 #include "pet_mood.h"
+#include "pet_quests.h"
+#include "pet_feedback.h"
 #include "pet_render.h"
 #include "species_index.h"
 #include "radiotchi_labels.h"
@@ -48,18 +50,19 @@
 // The "Debug" sprite gallery is a dev-only tool, compiled in only when RADIOTCHI_DEBUG is
 // defined (see application.fam). Release builds ship a 5-item menu without it.
 #ifdef RADIOTCHI_DEBUG
-#define MENU_COUNT 6u
-enum { MENU_DETAIL = 0, MENU_FEED, MENU_DEX, MENU_REGRADE, MENU_TUNE, MENU_DEBUG };
+#define MENU_COUNT 7u
+enum { MENU_DETAIL = 0, MENU_FEED, MENU_DEX, MENU_AWARDS, MENU_REGRADE, MENU_TUNE, MENU_DEBUG };
 static const char* const MENU_LABELS[MENU_COUNT] =
-    {"Detail", "Feed", "Dex", "Re-grade", "Tune", "Debug"};
+    {"Detail", "Feed", "Dex", "Awards", "Re-grade", "Tune", "Debug"};
 
 // Debug character gallery: egg + one child per family + every 100-type adult morph.
 #define DEBUG_GALLERY_COUNT (1u + PET_FAMILY_COUNT + PET_TYPE_COUNT) // 106
 #define DEBUG_GALLERY_STEP  10u // Up/Down fast-jump stride
 #else
-#define MENU_COUNT 5u
-enum { MENU_DETAIL = 0, MENU_FEED, MENU_DEX, MENU_REGRADE, MENU_TUNE };
-static const char* const MENU_LABELS[MENU_COUNT] = {"Detail", "Feed", "Dex", "Re-grade", "Tune"};
+#define MENU_COUNT 6u
+enum { MENU_DETAIL = 0, MENU_FEED, MENU_DEX, MENU_AWARDS, MENU_REGRADE, MENU_TUNE };
+static const char* const MENU_LABELS[MENU_COUNT] =
+    {"Detail", "Feed", "Dex", "Awards", "Re-grade", "Tune"};
 #endif
 
 #define MENU_PANEL_X      76 // left edge of the menu panel (pet sits to its left)
@@ -83,6 +86,7 @@ enum { EAT_PHASE_BARS = 0, EAT_PHASE_FLASH };
 #define EAT_EVT_LEVEL  0x1u // crossed a level boundary
 #define EAT_EVT_EVOLVE 0x2u // the 100-type morph changed (checkpoint re-speciation)
 #define EAT_EVT_RARE   0x4u // a novel / delicacy catch
+#define EAT_EVT_QUEST  0x8u // a new achievement unlocked this meal
 #define EAT_RARE_SCORE 0.8f // rarity at/above this counts as a delicacy
 
 typedef enum {
@@ -97,6 +101,7 @@ typedef enum {
     ScreenCaptureDetail,
     ScreenDexDiff,
     ScreenPetDetail,
+    ScreenAchievements,
     ScreenNameEdit,
     ScreenEatAnim,
 #ifdef RADIOTCHI_DEBUG
@@ -123,6 +128,7 @@ typedef struct {
     // pet + dex counts
     PetGrowth growth; // 5 stats + EXP/level/100-type morph (drives display + persistence)
     PetCare care; // last-feed time + meal quality (drives hunger/mood; persisted)
+    PetQuests quests; // lifetime achievements + feed streak (persisted alongside growth/care)
     char name[RADIOTCHI_PET_NAME_CAP];
     uint32_t dex_count;
     int regrade_result; // rows changed by the last dex re-grade (-1 = error)
@@ -150,9 +156,12 @@ typedef struct {
     uint8_t eat_phase; // EAT_PHASE_BARS | EAT_PHASE_FLASH
     uint8_t eat_event; // EAT_EVT_* bitmask for the flash phase
 
-    // detection tuning + last-sweep diagnostics
+    // detection tuning + feedback toggles + last-sweep diagnostics
     int16_t threshold;
     int16_t margin;
+    uint8_t snd_on; // sound cues on/off (mirrors feedback + persisted tuning; default off)
+    uint8_t vib_on; // haptic cues on/off (default off)
+    uint8_t settings_sel; // Settings cursor: 0=Thr 1=Mgn 2=Sound 3=Vibro
     bool have_sweep;
     int16_t floor;
     int16_t best;
@@ -187,6 +196,7 @@ typedef struct {
     SubGhzCaptureSource* capture;
     CaptureStore* store;
     SpeciesIndex* index;
+    PetFeedback* feedback; // sound/haptic cues (NULL-safe; user-toggled, both default off)
 
     // staged feed (between readout/label and eat); main-loop thread only
     const int32_t* pending_pulses;
@@ -373,17 +383,52 @@ static void draw_name_edit(Canvas* canvas, const AppModel* m) {
 
 static void draw_settings(Canvas* canvas, const AppModel* m) {
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 2, 11, "Tuning");
+    canvas_draw_str(canvas, 2, 10, "Settings");
     canvas_set_font(canvas, FontSecondary);
-    char line[40];
-    snprintf(line, sizeof(line), "Thr %ddBm  Mgn %ddB", (int)m->threshold, (int)m->margin);
-    canvas_draw_str(canvas, 2, 26, line);
-    if(m->have_sweep) {
-        snprintf(line, sizeof(line), "floor %d  best %d", (int)m->floor, (int)m->best);
-        canvas_draw_str(canvas, 2, 38, line);
+
+    // Cursor list: Up/Down move the cursor; Left/Right change the focused row.
+    char rows[4][24];
+    snprintf(rows[0], sizeof(rows[0]), "Threshold  %ddBm", (int)m->threshold);
+    snprintf(rows[1], sizeof(rows[1]), "Margin     %ddB", (int)m->margin);
+    snprintf(rows[2], sizeof(rows[2]), "Sound      %s", m->snd_on ? "On" : "Off");
+    snprintf(rows[3], sizeof(rows[3]), "Vibro      %s", m->vib_on ? "On" : "Off");
+    for(int i = 0; i < 4; i++) {
+        int y = 21 + i * 10;
+        if((int)m->settings_sel == i) canvas_draw_str(canvas, 2, y, ">");
+        canvas_draw_str(canvas, 10, y, rows[i]);
     }
-    canvas_draw_str(canvas, 2, 52, "Up/Dn:thr  L/R:mgn");
-    canvas_draw_str(canvas, 2, 62, "Back:home");
+
+    if(m->have_sweep) {
+        char diag[32];
+        snprintf(diag, sizeof(diag), "floor %d  best %d", (int)m->floor, (int)m->best);
+        canvas_draw_str(canvas, 2, 63, diag);
+    } else {
+        canvas_draw_str(canvas, 2, 63, "U/D:sel  L/R:edit");
+    }
+}
+
+// Achievements + feed streak. A check disc per quest (filled = unlocked); two columns. Privacy/
+// reversibility: this is pure presentation over pet_quests — it shows progress, never identity.
+static void draw_achievements(Canvas* canvas, const AppModel* m) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "Awards");
+    canvas_set_font(canvas, FontSecondary);
+
+    char line[32];
+    snprintf(
+        line, sizeof(line), "Streak %u  best %u", (unsigned)m->quests.feed_streak,
+        (unsigned)m->quests.best_streak);
+    canvas_draw_str(canvas, 2, 20, line);
+
+    for(int i = 0; i < QUEST_COUNT; i++) {
+        int x = (i / 4) ? 66 : 3;
+        int y = 31 + (i % 4) * 8;
+        if(pet_quest_unlocked(&m->quests, (QuestId)i))
+            canvas_draw_disc(canvas, x + 1, y - 2, 2);
+        else
+            canvas_draw_circle(canvas, x + 1, y - 2, 2);
+        canvas_draw_str(canvas, x + 7, y, pet_quest_name((QuestId)i));
+    }
 }
 
 static void draw_readout(Canvas* canvas, const AppModel* m) {
@@ -539,6 +584,7 @@ static void draw_eat_anim(Canvas* canvas, const AppModel* m) {
         canvas_set_font(canvas, FontPrimary);
         const char* banner = (evt & EAT_EVT_EVOLVE) ? "EVOLVED!" :
                              (evt & EAT_EVT_LEVEL)  ? "LEVEL UP!" :
+                             (evt & EAT_EVT_QUEST)  ? "ACHIEVEMENT!" :
                                                       "DELICACY!";
         canvas_draw_str_aligned(canvas, 64, 8, AlignCenter, AlignCenter, banner);
         canvas_set_color(canvas, ColorBlack);
@@ -692,6 +738,9 @@ static void draw_callback(Canvas* canvas, void* ctx) {
     case ScreenPetDetail:
         draw_pet_detail(canvas, m);
         break;
+    case ScreenAchievements:
+        draw_achievements(canvas, m);
+        break;
     case ScreenNameEdit:
         draw_name_edit(canvas, m);
         break;
@@ -812,7 +861,11 @@ static void apply_tuning(RadiotchiApp* app) {
     cfg.rssi_threshold_dbm = app->model.threshold;
     cfg.detection_margin_db = app->model.margin;
     subghz_capture_source_set_config(app->capture, cfg);
-    CaptureTuning t = {app->model.threshold, app->model.margin};
+    // Keep the feedback module in sync with the toggles, then persist all four settings.
+    pet_feedback_set_sound(app->feedback, app->model.snd_on != 0u);
+    pet_feedback_set_vibro(app->feedback, app->model.vib_on != 0u);
+    CaptureTuning t = {
+        app->model.threshold, app->model.margin, app->model.snd_on, app->model.vib_on};
     capture_store_save_tuning(app->store, &t);
 }
 
@@ -820,6 +873,7 @@ static void apply_tuning(RadiotchiApp* app) {
 
 static void do_feed(RadiotchiApp* app) {
     set_screen(app, ScreenFeedScan);
+    pet_feedback_play(app->feedback, FEEDBACK_FEED_SCAN); // a short "scanning" blip
 
     CaptureSource cs = subghz_capture_source_as_source(app->capture);
     RawCapture raw;
@@ -835,6 +889,7 @@ static void do_feed(RadiotchiApp* app) {
         app->model.best = best;
         app->model.screen = ScreenNoSignal;
         furi_mutex_release(app->mutex);
+        pet_feedback_play(app->feedback, FEEDBACK_NO_SIGNAL); // sweep caught nothing
         view_port_update(app->view_port);
         return;
     }
@@ -921,20 +976,40 @@ static void do_eat(RadiotchiApp* app) {
         &app->model.growth, &app->model.ev, app->pending_seen_count, adj_gain,
         raw_gain ? raw_gain : 1u);
     pet_care_feed(&app->model.care, &app->model.ev, app->model.ev.timestamp);
-    capture_store_save_growth(app->store, &app->model.growth, &app->model.care, app->model.name);
 
-    // What to celebrate: level-up, evolution (morph changed), and/or a delicacy/novel catch.
+    // Quests/streak: register the meal (dex breadth injected as data); newly = this meal's unlocks.
+    uint32_t newly_quests = pet_quests_feed(
+        &app->model.quests, &app->model.ev, species_index_count(app->index), app->model.ev.timestamp);
+
+    capture_store_save_growth(
+        app->store, &app->model.growth, &app->model.care, &app->model.quests, app->model.name);
+
+    // What to celebrate: level-up, evolution (morph changed), a delicacy/novel catch, or a
+    // fresh achievement.
     uint8_t evt = 0u;
     if(app->model.growth.level > before.level) evt |= EAT_EVT_LEVEL;
     if(app->model.growth.type_id != before.type_id) evt |= EAT_EVT_EVOLVE;
     if(app->pending_seen_count == 0u || app->model.ev.scores.rarity >= EAT_RARE_SCORE)
         evt |= EAT_EVT_RARE;
+    if(newly_quests != 0u) evt |= EAT_EVT_QUEST;
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     app->model.dex_count = species_index_count(app->index);
     app->model.now_cache = app->model.ev.timestamp; // mood reflects the fresh meal at once
     app->model.eat_event = evt;
     furi_mutex_release(app->mutex);
+
+    // One feedback cue, highest-priority event first (RX-safe: the sweep already returned).
+    FeedbackCue cue = FEEDBACK_EAT;
+    if(evt & EAT_EVT_EVOLVE)
+        cue = FEEDBACK_EVOLVE;
+    else if(newly_quests != 0u)
+        cue = FEEDBACK_QUEST;
+    else if(evt & EAT_EVT_LEVEL)
+        cue = FEEDBACK_LEVEL_UP;
+    else if(evt & EAT_EVT_RARE)
+        cue = FEEDBACK_DELICACY;
+    pet_feedback_play(app->feedback, cue);
 
     FURI_LOG_I(
         TAG,
@@ -974,7 +1049,8 @@ static void commit_name(RadiotchiApp* app) {
     for(int i = (int)strlen(app->model.name) - 1; i >= 0 && app->model.name[i] == ' '; i--)
         app->model.name[i] = '\0';
     furi_mutex_release(app->mutex);
-    capture_store_save_growth(app->store, &app->model.growth, &app->model.care, app->model.name);
+    capture_store_save_growth(
+        app->store, &app->model.growth, &app->model.care, &app->model.quests, app->model.name);
 }
 
 // ========================= dex read ======================================
@@ -1006,6 +1082,9 @@ static void run_menu_command(RadiotchiApp* app) {
         app->model.species_sel = 0;
         app->model.species_scroll = 0;
         set_screen(app, ScreenDexSpecies);
+        break;
+    case MENU_AWARDS:
+        set_screen(app, ScreenAchievements);
         break;
     case MENU_REGRADE:
         do_regrade(app);
@@ -1110,6 +1189,10 @@ static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* runnin
             set_screen(app, ScreenHome);
         break;
 
+    case ScreenAchievements:
+        if(key == InputKeyBack && type == InputTypeShort) set_screen(app, ScreenHome);
+        break;
+
     case ScreenNameEdit:
         if(type != InputTypeShort && type != InputTypeRepeat) break;
         if(key == InputKeyUp)
@@ -1132,19 +1215,37 @@ static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* runnin
 
     case ScreenSettings:
         if(key == InputKeyUp) {
-            app->model.threshold = clamp16(app->model.threshold + THRESHOLD_STEP, THRESHOLD_MIN, THRESHOLD_MAX);
-            apply_tuning(app);
+            if(app->model.settings_sel > 0) app->model.settings_sel--;
             view_port_update(app->view_port);
         } else if(key == InputKeyDown) {
-            app->model.threshold = clamp16(app->model.threshold - THRESHOLD_STEP, THRESHOLD_MIN, THRESHOLD_MAX);
+            if(app->model.settings_sel < 3) app->model.settings_sel++;
+            view_port_update(app->view_port);
+        } else if(key == InputKeyRight || key == InputKeyLeft) {
+            int dir = (key == InputKeyRight) ? 1 : -1;
+            switch(app->model.settings_sel) {
+            case 0:
+                app->model.threshold = clamp16(
+                    app->model.threshold + dir * THRESHOLD_STEP, THRESHOLD_MIN, THRESHOLD_MAX);
+                break;
+            case 1:
+                app->model.margin =
+                    clamp16(app->model.margin + dir * MARGIN_STEP, MARGIN_MIN, MARGIN_MAX);
+                break;
+            case 2:
+                app->model.snd_on = app->model.snd_on ? 0u : 1u;
+                break;
+            default:
+                app->model.vib_on = app->model.vib_on ? 0u : 1u;
+                break;
+            }
             apply_tuning(app);
             view_port_update(app->view_port);
-        } else if(key == InputKeyRight) {
-            app->model.margin = clamp16(app->model.margin + MARGIN_STEP, MARGIN_MIN, MARGIN_MAX);
-            apply_tuning(app);
-            view_port_update(app->view_port);
-        } else if(key == InputKeyLeft) {
-            app->model.margin = clamp16(app->model.margin - MARGIN_STEP, MARGIN_MIN, MARGIN_MAX);
+        } else if(key == InputKeyOk && type == InputTypeShort) {
+            // OK also toggles the focused Sound / Vibro row (convenience).
+            if(app->model.settings_sel == 2)
+                app->model.snd_on = app->model.snd_on ? 0u : 1u;
+            else if(app->model.settings_sel == 3)
+                app->model.vib_on = app->model.vib_on ? 0u : 1u;
             apply_tuning(app);
             view_port_update(app->view_port);
         } else if(key == InputKeyBack && type == InputTypeShort) {
@@ -1286,23 +1387,30 @@ static RadiotchiApp* radiotchi_app_alloc(void) {
     if(app->index) species_index_load(app->index);
     app->model.dex_count = species_index_count(app->index);
 
-    // Seed tuning from persisted config, else defaults.
-    CaptureTuning t = {cfg.rssi_threshold_dbm, cfg.detection_margin_db};
+    // Seed tuning from persisted config, else defaults (sound/vibro default OFF).
+    CaptureTuning t = {cfg.rssi_threshold_dbm, cfg.detection_margin_db, 0, 0};
     if(app->store) capture_store_load_tuning(app->store, &t);
     app->model.threshold = t.rssi_threshold_dbm;
     app->model.margin = t.detection_margin_db;
+    app->model.snd_on = t.sound_enabled;
+    app->model.vib_on = t.vibro_enabled;
+    app->model.settings_sel = 0;
     cfg.rssi_threshold_dbm = t.rssi_threshold_dbm;
     cfg.detection_margin_db = t.detection_margin_db;
     if(app->capture) subghz_capture_source_set_config(app->capture, cfg);
+
+    // Sound/haptic cues, seeded from persisted settings (both default OFF; back-compat OFF).
+    app->feedback = pet_feedback_alloc(t.sound_enabled != 0u, t.vibro_enabled != 0u);
 
     // Load the growth layer + care + name, or start a fresh Unformed pet named "Radiotchi".
     // (load_growth always seeds care to never-fed grace, so a fresh or pre-care pet is safe.)
     if(!app->store ||
        !capture_store_load_growth(
-           app->store, &app->model.growth, &app->model.care, app->model.name,
+           app->store, &app->model.growth, &app->model.care, &app->model.quests, app->model.name,
            RADIOTCHI_PET_NAME_CAP)) {
         pet_growth_init(&app->model.growth);
         pet_care_init(&app->model.care);
+        pet_quests_init(&app->model.quests);
         strncpy(app->model.name, "Radiotchi", RADIOTCHI_PET_NAME_CAP - 1);
     }
     if(app->model.name[0] == '\0') strncpy(app->model.name, "Radiotchi", RADIOTCHI_PET_NAME_CAP - 1);
@@ -1330,6 +1438,7 @@ static void radiotchi_app_free(RadiotchiApp* app) {
     furi_record_close(RECORD_GUI);
     view_port_free(app->view_port);
 
+    if(app->feedback) pet_feedback_free(app->feedback);
     if(app->index) species_index_free(app->index);
     if(app->capture) subghz_capture_source_free(app->capture);
     if(app->store) capture_store_free(app->store);

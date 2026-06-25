@@ -48,8 +48,9 @@ visible rows), **OK runs**, **Back dismisses** to the clean pet view. Commands:
 | **Detail** | Pet Detail (§3) | Inspect the pet: name, level/exp, type, parameters |
 | **Feed** (primary) | Feed Flow (§4) | Capture the strongest signal and feed it |
 | **Dex** | Dex Browser (§5) | Browse collected species / captures |
+| **Awards** | Achievements (§7) | Lifetime achievements + the current feed streak (D35) |
 | **Re-grade** | result toast | Re-run the decoder over the whole capture log so old captures gain Nourishment / graduate species (D25); shows how many changed |
-| **Tune** | Settings (§6) | Band preset and pet name |
+| **Tune** | Settings (§6) | Detection tuning + sound/vibration toggles |
 
 ### 3. Pet Detail
 
@@ -98,10 +99,25 @@ A short sequence triggered by the **Feed** command (§2); no free navigation mid
 
 ### 6. Settings (Tune)
 
-- **Band preset** — the Sub-GHz frequency plan used by the sweep (the primary MVP setting; see
-  [decision-log.md](decision-log.md) D14).
-- **Pet name** — edit the user-given name (also reachable from Pet Detail §3).
-- Keep it lean; nothing here beyond the above for v1.
+A **4-row cursor list**: **Up/Down** move the cursor, **Left/Right** change the focused row,
+**OK** toggles the focused Sound/Vibro row, **Back** returns Home (changes persist). Rows:
+
+- **Threshold** — the absolute RSSI detection floor (dBm) for the sweep.
+- **Margin** — the dB a signal must clear above the noise floor to be captured.
+- **Sound** — feed / eat / milestone sound cues on/off (**default Off**; D35).
+- **Vibro** — haptic cues on milestones on/off (**default Off**; D35).
+
+Sound and Vibro are **independent** toggles. The bottom line shows the last sweep's `floor`/`best`
+(a tuning aid) when available. The pet **name** is edited from Pet Detail (§3), not here.
+
+### 7. Achievements (Awards)
+
+Reached from the **Awards** command (§2). A read-only card: a **feed-streak** line (current +
+best) and the 7 **achievements** as a two-column grid, each a filled disc (unlocked) or a hollow
+ring (locked) with a short name. Pure presentation over the host-tested quest layer (`pet_quests`,
+D35) — it shows *progress*, never identity, and grants no power (reinforces D2). **Back** returns
+Home; a freshly-unlocked achievement also flashes an `ACHIEVEMENT!` banner + cue during the eat
+celebration.
 
 ## Sprite & Animation Sizing
 
@@ -138,4 +154,6 @@ A short sequence triggered by the **Feed** command (§2); no free navigation mid
 
 - Battle/versus screens (future; see [architecture.md](architecture.md) §7).
 - Autonomous behaviors beyond the Idle animation (wander/react/sleep are post-MVP).
-- Settings beyond the band-preset selector and pet name (keep the MVP lean).
+- Settings beyond detection tuning + the sound/vibration toggles (§6); keep it lean. (D35 added
+  the feedback toggles; richer per-mood / 128×64 animations remain deferred — see
+  [open-questions.md](open-questions.md) Q8.)

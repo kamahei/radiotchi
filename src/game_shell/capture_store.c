@@ -96,6 +96,14 @@ bool capture_store_load_tuning(CaptureStore* store, CaptureTuning* out) {
         if(sscanf(buf, "threshold=%d margin=%d", &thr, &mgn) == 2) {
             out->rssi_threshold_dbm = (int16_t)thr;
             out->detection_margin_db = (int16_t)mgn;
+            // Optional "sound=" / "vibro=" tokens. Absent in pre-feedback configs => default OFF.
+            out->sound_enabled = 0;
+            out->vibro_enabled = 0;
+            unsigned snd = 0, vib = 0;
+            const char* ps = strstr(buf, "sound=");
+            if(ps != NULL && sscanf(ps + 6, "%u", &snd) == 1) out->sound_enabled = snd ? 1u : 0u;
+            const char* pv = strstr(buf, "vibro=");
+            if(pv != NULL && sscanf(pv + 6, "%u", &vib) == 1) out->vibro_enabled = vib ? 1u : 0u;
             ok = true;
         }
     }
@@ -111,9 +119,11 @@ void capture_store_save_tuning(CaptureStore* store, const CaptureTuning* tuning)
         FuriString* s = furi_string_alloc();
         furi_string_printf(
             s,
-            "threshold=%d margin=%d\n",
+            "threshold=%d margin=%d sound=%u vibro=%u\n",
             (int)tuning->rssi_threshold_dbm,
-            (int)tuning->detection_margin_db);
+            (int)tuning->detection_margin_db,
+            (unsigned)(tuning->sound_enabled ? 1u : 0u),
+            (unsigned)(tuning->vibro_enabled ? 1u : 0u));
         file_write_str(f, furi_string_get_cstr(s));
         furi_string_free(s);
     }
@@ -129,15 +139,16 @@ static int to_centi(float v) {
 }
 
 bool capture_store_load_growth(
-    CaptureStore* store, PetGrowth* out, PetCare* care, char* name, size_t name_cap) {
+    CaptureStore* store, PetGrowth* out, PetCare* care, PetQuests* quests, char* name, size_t name_cap) {
     if(store == NULL || out == NULL) return false;
     if(care != NULL) pet_care_init(care); // never-fed default; overwritten if a care= line exists
+    if(quests != NULL) pet_quests_init(quests); // no-progress default; overwritten by a quest= line
     if(!storage_file_exists(store->storage, RADIOTCHI_GROWTH_PATH)) return false;
 
     File* f = storage_file_alloc(store->storage);
     bool ok = false;
     if(storage_file_open(f, RADIOTCHI_GROWTH_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        char buf[256] = {0};
+        char buf[384] = {0}; // growth + name + care + quest lines (bumped from 256 for quest=)
         size_t n = storage_file_read(f, buf, sizeof(buf) - 1);
         buf[n] = '\0';
         int s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
@@ -191,6 +202,27 @@ bool capture_store_load_growth(
                 }
             }
         }
+        // Optional "quest=<total> <delicacy> <decoded> <species> <streak> <best> <last> <mask>"
+        // line. Absent in pre-quest files, which keep the fresh pet_quests_init above.
+        if(ok && quests != NULL) {
+            const char* p = strstr(buf, "quest=");
+            if(p != NULL) {
+                unsigned long tf = 0, df = 0, dc = 0, sp = 0, mask = 0;
+                unsigned fs = 0, bs = 0;
+                unsigned long long lft = 0;
+                if(sscanf(p + 6, "%lu %lu %lu %lu %u %u %llu %lu", &tf, &df, &dc, &sp, &fs, &bs, &lft, &mask) ==
+                   8) {
+                    quests->total_feeds = (uint32_t)tf;
+                    quests->delicacy_feeds = (uint32_t)df;
+                    quests->decoded_feeds = (uint32_t)dc;
+                    quests->distinct_species = (uint32_t)sp;
+                    quests->feed_streak = (uint16_t)fs;
+                    quests->best_streak = (uint16_t)bs;
+                    quests->last_feed_time = (uint64_t)lft;
+                    quests->unlocked_mask = (uint32_t)mask;
+                }
+            }
+        }
     }
     storage_file_close(f);
     storage_file_free(f);
@@ -198,14 +230,19 @@ bool capture_store_load_growth(
 }
 
 void capture_store_save_growth(
-    CaptureStore* store, const PetGrowth* g, const PetCare* care, const char* name) {
+    CaptureStore* store,
+    const PetGrowth* g,
+    const PetCare* care,
+    const PetQuests* quests,
+    const char* name) {
     if(store == NULL || g == NULL) return;
     File* f = storage_file_alloc(store->storage);
     if(storage_file_open(f, RADIOTCHI_GROWTH_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         FuriString* s = furi_string_alloc();
         furi_string_printf(
             s,
-            "s0=%d s1=%d s2=%d s3=%d s4=%d exp=%lu level=%u type=%u\nname=%s\ncare=%llu %u\n",
+            "s0=%d s1=%d s2=%d s3=%d s4=%d exp=%lu level=%u type=%u\nname=%s\ncare=%llu %u\n"
+            "quest=%lu %lu %lu %lu %u %u %llu %lu\n",
             to_centi(g->stat[0]),
             to_centi(g->stat[1]),
             to_centi(g->stat[2]),
@@ -216,7 +253,15 @@ void capture_store_save_growth(
             (unsigned)g->type_id,
             (name != NULL ? name : ""),
             (unsigned long long)(care != NULL ? care->last_feed_time : 0u),
-            (unsigned)(care != NULL ? care->last_meal_quality : 0u));
+            (unsigned)(care != NULL ? care->last_meal_quality : 0u),
+            (unsigned long)(quests != NULL ? quests->total_feeds : 0u),
+            (unsigned long)(quests != NULL ? quests->delicacy_feeds : 0u),
+            (unsigned long)(quests != NULL ? quests->decoded_feeds : 0u),
+            (unsigned long)(quests != NULL ? quests->distinct_species : 0u),
+            (unsigned)(quests != NULL ? quests->feed_streak : 0u),
+            (unsigned)(quests != NULL ? quests->best_streak : 0u),
+            (unsigned long long)(quests != NULL ? quests->last_feed_time : 0u),
+            (unsigned long)(quests != NULL ? quests->unlocked_mask : 0u));
         file_write_str(f, furi_string_get_cstr(s));
         furi_string_free(s);
     }

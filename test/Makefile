@@ -29,10 +29,15 @@ $(BUILD)/test_pet_mood: test_pet_mood.c $(GAME)/pet_mood.c $(GAME)/pet_growth.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -I$(CORE) -I$(GAME) $^ -o $@
 
-test: $(BUILD)/test_analysis_core $(BUILD)/test_pet_growth $(BUILD)/test_pet_mood
+$(BUILD)/test_pet_quests: test_pet_quests.c $(GAME)/pet_quests.c $(GAME)/pet_growth.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -I$(CORE) -I$(GAME) $^ -o $@
+
+test: $(BUILD)/test_analysis_core $(BUILD)/test_pet_growth $(BUILD)/test_pet_mood $(BUILD)/test_pet_quests
 	./$(BUILD)/test_analysis_core
 	./$(BUILD)/test_pet_growth
 	./$(BUILD)/test_pet_mood
+	./$(BUILD)/test_pet_quests
 
 clean:
 	rm -rf $(BUILD)
