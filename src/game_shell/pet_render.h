@@ -8,6 +8,7 @@
 #include <gui/gui.h>
 
 #include "pet_growth.h"
+#include "pet_mood.h" // PetMood (the mood overlay)
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,14 @@ extern "C" {
 // docs/codex-sprite-brief.md). `frame & 3` cycles the 4-frame idle sway.
 // Allocation-free; the sprite is drawn by reference (D22).
 void pet_render_draw_growth(Canvas* canvas, const PetGrowth* g, int cx, int cy, uint32_t frame);
+
+// As pet_render_draw_growth, plus a small 1-bit mood marker drawn over the sprite (a
+// sparkle when content, "..." when hungry, a "z" when neglected; nothing for happy/neutral).
+// The caller passes `frame` already remapped for the mood (pet_mood_anim_frame), so a hungry
+// pet sways sluggishly and a neglected one is listless. No new sprites — markers are drawn
+// with canvas primitives, so the per-type art does not multiply by mood. Allocation-free.
+void pet_render_draw_growth_mood(
+    Canvas* canvas, const PetGrowth* g, PetMood mood, int cx, int cy, uint32_t frame);
 
 #ifdef __cplusplus
 }

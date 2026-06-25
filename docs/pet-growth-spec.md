@@ -211,8 +211,18 @@ void     pet_type_name(uint8_t, char* buf, size_t n);          // e.g. "Wild-Aur
   ship in `icons/` and are compiled in by fbt (`fap_icon_assets` → `radiotchi_icons.h`);
   `pet_sprites.c` draws them with `canvas_draw_icon` (by reference). Pipeline: §5 +
   `tools/convert_art.py`. FAP builds clean (Target 7 / API 87.1).
-- **Deferred (calibration):** `EXP_BASE/EXP_K/EXP_DECAY_HALF`, shape thresholds, stat α, and
-  the per-mood / 128×64 special-animation set — see [open-questions.md](open-questions.md) Q8.
+- **Care/mood layer (on-device, D33):** a PURE `pet_mood.{c,h}` derives **hunger** + a **mood**
+  from time-since-last-meal (`PetCare`, persisted as a back-compatible `care=` line in
+  `growth.txt`). Mood drives the Home pet's look **without new art** (a frame remap + a few-pixel
+  procedural marker, `pet_render_draw_growth_mood`); long neglect softens **only** a meal's exp
+  (`pet_growth_feed_scaled`) — never the reversible stat EMA/level/type. Constants are PROVISIONAL
+  ([open-questions.md](open-questions.md) Q9). Host-tested (`test_pet_mood`, `test_feed_scaled`).
+- **Special animations (on-device, D33):** the eat celebration's flash is now event-aware (an
+  `eat_event` bitmask: level-up / evolution / delicacy) with procedural sparkles, an evolution
+  frame-shake + burst ring — no new screen or assets (see [ui-spec.md](ui-spec.md)).
+- **Deferred (calibration):** `EXP_BASE/EXP_K/EXP_DECAY_HALF`, shape thresholds, stat α, the
+  care/mood constants (Q9), and the per-mood / 128×64 full-frame animation set — see
+  [open-questions.md](open-questions.md) Q8/Q9.
 - **Follow-up:** regenerate art into `art/` (Codex) and re-run `tools/convert_art.py` — no code
   change needed; per-mood variants and richer (full 128×64) animations. Keep sprites compiled-in
   and drawn **by reference** — never copy a large sprite buffer onto the ViewPort draw stack

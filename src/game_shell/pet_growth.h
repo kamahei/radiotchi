@@ -107,6 +107,11 @@ typedef struct {
 // Initialize a fresh pet: zeroed stats, no exp, level 0, Unformed.
 void pet_growth_init(PetGrowth* g);
 
+// The delicacy-favoring meal quality in [0,1] (low additives, high rarity/nourishment
+// score the most). Exposed so the care/mood layer reuses the EXACT same weighting the exp
+// curve uses, instead of duplicating the magic weights. Pure.
+float pet_growth_meal_quality(const CaptureEvent* ev);
+
 // exp granted by one meal. Favors delicacies (low additives, high rarity/
 // nourishment) and decays with how often this species was already seen (D1/D2).
 uint32_t pet_growth_exp_gain(const CaptureEvent* ev, uint32_t seen_count);
@@ -122,6 +127,13 @@ PetLifeStage pet_life_stage(uint16_t level);
 // `seen_count` is the species' prior occurrence count (0 => novel/first-seen),
 // driving both the EMA pull strength and the exp repeat-decay.
 void pet_growth_feed(PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count);
+
+// As pet_growth_feed, but scales ONLY the exp this meal grants by exp_num/exp_den (the
+// stat EMA, level math, and morph are identical). Used by the care layer to soften exp
+// for a neglected pet — neglect only ever slows growth, never reverses it, never touches
+// stats. `pet_growth_feed` is exactly this with a 1/1 ratio. Pure.
+void pet_growth_feed_scaled(
+    PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count, uint32_t exp_num, uint32_t exp_den);
 
 // Map a 5-stat vector to one of the 100 type ids (0..99). Deterministic; ties are
 // broken by ascending stat index (MASS < VIGOR < WILD < AURA < MIND).

@@ -120,6 +120,20 @@ The **visible life stage** (egg / child / adult morph) is **derived from `level`
 **not** a stored field. Pet graphics are composed from layered 1-bit parts keyed by `type_id`,
 not one sprite per type; see [pet-growth-spec.md](pet-growth-spec.md) §5.
 
+**Care/mood layer (`PetCare`, `pet_mood.h`, D33).** A thin presentation + soft-pressure layer
+over the growth identity — it never touches `stat[]`/`exp`/`level`/`type_id`. Just two persisted
+scalars, derived into hunger and a mood (content/happy/neutral/hungry/neglected) against an
+injected "now":
+
+| Field | Purpose |
+|---|---|
+| `last_feed_time` | Epoch seconds of the last meal (`0` = never fed → grace, no hunger) |
+| `last_meal_quality` | `0..100`, centi of `pet_growth_meal_quality` at that meal (drives the content look) |
+
+Persisted as a **back-compatible third line** in `growth.txt`: `care=<last_feed_time> <quality>`.
+A pre-care file (no `care=` line) loads its growth+name unchanged and seeds `PetCare` to never-fed
+grace, so upgrading an existing pet never triggers false starvation.
+
 ## Enumerations
 
 ```c
@@ -201,5 +215,10 @@ locally for diff-based learning, but:
 - Individual tracking (D27) uses a **one-way hashed** tag (`CaptureEvent.individual`, `id-XXXX`):
   the same device recurs under the same tag for local diff-learning, but the raw code cannot be
   recovered from it — the dex can show recurrence without becoming a device/vehicle tracker.
+- The **diff-learning view** (`ByteDiff` from `radiotchi_byte_diff`, D32) is a **derived,
+  non-persisted** result: frames are re-decoded from the lossless `.sub` on demand
+  (`capture_store_collect_payloads`), classified per byte (id / counter / value / absent), and
+  the UI renders only the **class markers, never the raw byte values** — it *locates* the id
+  bytes for learning without surfacing the trackable id.
 
 See [acceptance-criteria.md](acceptance-criteria.md) for the verifiable form of these rules.

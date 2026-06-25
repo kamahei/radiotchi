@@ -283,6 +283,174 @@ bool radiotchi_ook_pwm_decode(const int16_t* pulses, uint16_t n, uint32_t* code,
     return true;
 }
 
+// --- real demodulation: 2FSK sensor frame (PCM/NRZ weather/telemetry/TPMS) -----
+//
+// The firmware's async-RAW slicer turns the 2FSK discriminator output into the SAME
+// signed level/duration pulse train shape as OOK, so we demodulate the bit-level
+// transition timing here (not I/Q), keeping the core libm-free. The sensor class is
+// overwhelmingly PCM/NRZ at a fixed bit period: estimate the period as the robust-min
+// run, expand each run into round(dur/period) NRZ bits (mark=1, space=0), and split
+// frames at the long inter-frame gap. As with the OOK decoder we only trust a frame an
+// immediately-following repeat confirms byte-for-byte (real sensors retransmit; ambient
+// noise does not) — that repeat guard is what stops noise from faking a frame.
+#define WV_FSK_GLITCH_US 40u // ignore sub-40us spikes when estimating the bit period
+#define WV_FSK_GAP_MULT  16u // a run >= this x the bit period (or the floor) ends a frame
+#define WV_FSK_GAP_FLOOR 4000u // ...or an absolute several-ms inter-frame gap
+#define WV_FSK_MIN_BITS  16u // a real sensor frame, not a stray blip
+#define WV_FSK_RUN_CAP   32u // one NRZ run expanding past this is anomalous (not clean PCM)
+
+// Decode the first NRZ frame at pulses[start] into packed bytes (MSB-first). A frame ends
+// at the long inter-frame gap. Returns the bit length via *nbits and the index just past the
+// frame via *next; false if no plausible frame (too few bits, or an anomalous long run).
+static bool decode_fsk_frame(
+    const int16_t* pulses,
+    uint16_t n,
+    uint16_t start,
+    uint32_t bit_period,
+    uint8_t* bytes,
+    uint16_t cap,
+    uint16_t* nbits,
+    uint16_t* next) {
+    uint32_t gap = bit_period * WV_FSK_GAP_MULT;
+    if(gap < WV_FSK_GAP_FLOOR) gap = WV_FSK_GAP_FLOOR;
+    for(uint16_t b = 0; b < cap; b++) bytes[b] = 0;
+
+    uint16_t count = 0; // bits accumulated
+    uint16_t i = start;
+    bool started = false;
+    for(; i < n; i++) {
+        uint32_t mag = abs32(pulses[i]);
+        if(mag < WV_FSK_GLITCH_US) continue; // drop a noise spike, stay in the frame
+        if(mag >= gap) { // inter-frame gap
+            if(started) {
+                i++; // consume the gap so the next frame starts past it
+                break;
+            }
+            continue; // leading silence before the frame: skip it
+        }
+        started = true;
+        uint32_t runbits = (mag + bit_period / 2u) / bit_period; // round to whole bits
+        if(runbits < 1u) runbits = 1u;
+        if(runbits > WV_FSK_RUN_CAP) return false; // not a clean NRZ run
+        uint8_t bit = (pulses[i] > 0) ? 1u : 0u; // mark=1, space=0
+        for(uint32_t r = 0; r < runbits && count < (uint16_t)(cap * 8u); r++) {
+            if(bit) bytes[count >> 3] |= (uint8_t)(0x80u >> (count & 7u));
+            count++;
+        }
+    }
+    if(count < WV_FSK_MIN_BITS) return false;
+    if(nbits) *nbits = count;
+    if(next) *next = i;
+    return true;
+}
+
+bool radiotchi_fsk_sensor_decode(
+    const int16_t* pulses, uint16_t n, uint8_t* frame, uint16_t cap, uint16_t* frame_len) {
+    if(pulses == NULL || frame == NULL || cap == 0 || n < WV_FSK_MIN_BITS) return false;
+
+    // Bit period = the robust-minimum run (glitch-filtered); gap-scale runs are far larger,
+    // so they never pull the min down.
+    uint32_t bit_period = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        uint32_t m = abs32(pulses[i]);
+        if(m < WV_FSK_GLITCH_US) continue;
+        if(bit_period == 0 || m < bit_period) bit_period = m;
+    }
+    if(bit_period == 0) return false;
+
+    uint16_t fcap = cap < RADIOTCHI_FSK_FRAME_MAX ? cap : RADIOTCHI_FSK_FRAME_MAX;
+    uint8_t f0[RADIOTCHI_FSK_FRAME_MAX];
+    uint8_t f1[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t nb0 = 0, nb1 = 0, next = 0, dummy = 0;
+    if(!decode_fsk_frame(pulses, n, 0, bit_period, f0, fcap, &nb0, &next)) return false;
+
+    // REQUIRE a confirming repeat with identical bytes (the OOK noise guard, for FSK). A lone
+    // or disagreeing frame is distrusted, so ambient noise cannot reach VALUES.
+    if(next >= n) return false;
+    if(!decode_fsk_frame(pulses, n, next, bit_period, f1, fcap, &nb1, &dummy)) return false;
+    if(nb0 != nb1) return false;
+    uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);
+    if(nbytes > fcap) nbytes = fcap;
+    for(uint16_t i = 0; i < nbytes; i++) {
+        if(f0[i] != f1[i]) return false; // frames disagree => distrust
+    }
+    for(uint16_t i = 0; i < nbytes; i++) frame[i] = f0[i];
+    if(frame_len) *frame_len = nbytes;
+    return true;
+}
+
+void radiotchi_individual_fingerprint_bytes(
+    const uint8_t* frame, uint16_t len, char* out, size_t out_len) {
+    if(out == NULL || out_len == 0) return;
+    // FNV-1a over the frame bytes + length, folded to 16 bits (same one-way scheme as
+    // radiotchi_individual_fingerprint): a stable per-device "id-XXXX" the raw frame cannot
+    // be recovered from (A5).
+    uint32_t h = 2166136261u;
+    if(frame != NULL) {
+        for(uint16_t i = 0; i < len; i++) {
+            h ^= frame[i];
+            h *= 16777619u;
+        }
+    }
+    h ^= (uint8_t)(len & 0xFFu);
+    h *= 16777619u;
+    uint16_t tag = (uint16_t)((h ^ (h >> 16)) & 0xFFFFu);
+    snprintf(out, out_len, "id-%04x", (unsigned)tag);
+    out[out_len - 1] = '\0';
+}
+
+// --- diff-learning: classify aligned decoded frames byte-by-byte ---------------
+//
+// Given N captures' decoded frames of the same device, classify each byte position so the dex
+// can teach reverse-engineering by play: a byte equal across all frames is an identifier/fixed
+// field (STATIC); one stepping by a constant non-zero amount (mod 256, so a wrapping counter
+// reads cleanly) is a rolling counter (INCREMENTING); anything else is a sensor value/payload
+// (VARYING); positions past the shortest frame are ABSENT. Integer-only & deterministic.
+ByteDiff radiotchi_byte_diff(const uint8_t* const* payloads, const uint16_t* lens, uint8_t count) {
+    ByteDiff d;
+    memset(&d, 0, sizeof(d));
+    d.count = count;
+    if(payloads == NULL || lens == NULL || count < 2) {
+        d.width = 0;
+        return d;
+    }
+
+    uint16_t minlen = lens[0];
+    uint16_t maxlen = lens[0];
+    for(uint8_t i = 1; i < count; i++) {
+        if(lens[i] < minlen) minlen = lens[i];
+        if(lens[i] > maxlen) maxlen = lens[i];
+    }
+    uint16_t width = maxlen > RADIOTCHI_DIFF_BYTES_MAX ? RADIOTCHI_DIFF_BYTES_MAX : maxlen;
+    d.width = width;
+
+    for(uint16_t p = 0; p < width; p++) {
+        if(p >= minlen) { // ragged: at least one frame lacks this byte
+            d.cls[p] = BYTE_ABSENT;
+            continue;
+        }
+        bool all_equal = true;
+        for(uint8_t i = 1; i < count; i++) {
+            if(payloads[i][p] != payloads[0][p]) {
+                all_equal = false;
+                break;
+            }
+        }
+        if(all_equal) {
+            d.cls[p] = BYTE_STATIC;
+            continue;
+        }
+        uint8_t step = (uint8_t)(payloads[1][p] - payloads[0][p]);
+        bool incrementing = (step != 0);
+        for(uint8_t i = 1; incrementing && (uint8_t)(i + 1) < count; i++) {
+            uint8_t s = (uint8_t)(payloads[i + 1][p] - payloads[i][p]);
+            if(s != step) incrementing = false;
+        }
+        d.cls[p] = incrementing ? BYTE_INCREMENTING : BYTE_VARYING;
+    }
+    return d;
+}
+
 // --- encoding-agnostic repeating-frame detector (the general VALUES path) ----
 //
 // The PWM bit decoder only reads one encoding. Real remotes use many (Manchester, PCM, ...),
@@ -565,6 +733,22 @@ CaptureEvent analyze_capture(
                 ev.species_id, sizeof(ev.species_id), "ook-fixed-%u",
                 (unsigned)band_bucket_mhz(ev.frequency_hz));
             ev.species_id[sizeof(ev.species_id) - 1] = '\0';
+        }
+    } else if(raw->modulation == MOD_2FSK && raw->pulse_count > 0) {
+        // Structured 2FSK sensor (weather/telemetry/TPMS): demodulate the PCM/NRZ frame from
+        // the pulse timing -> TIER_VALUES. Privacy (A5): the species stays family-level
+        // (fsk-sensor-<band>); the decoded frame only justifies the tier and a one-way tag.
+        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+        uint16_t flen = 0;
+        if(radiotchi_fsk_sensor_decode(raw->pulses, raw->pulse_count, frame, sizeof(frame), &flen)) {
+            ev.decode_tier = TIER_VALUES;
+            strncpy(ev.protocol, WV_PROTO_FSK_SENSOR, sizeof(ev.protocol) - 1);
+            ev.protocol[sizeof(ev.protocol) - 1] = '\0';
+            snprintf(
+                ev.species_id, sizeof(ev.species_id), "fsk-sensor-%u",
+                (unsigned)band_bucket_mhz(ev.frequency_hz));
+            ev.species_id[sizeof(ev.species_id) - 1] = '\0';
+            radiotchi_individual_fingerprint_bytes(frame, flen, ev.individual, sizeof(ev.individual));
         }
     }
 

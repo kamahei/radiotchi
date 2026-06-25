@@ -140,7 +140,11 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   pulse train through a `SubGhzReceiver`/`subghz_protocol_registry` and reports the decoded
   protocol + a privacy-safe hashed serial in `RawCapture.fw_protocol`/`fw_individual`, which the
   core uses ahead of the heuristics. Builds + links clean; on-device runtime validation pending.
-  Remaining: more pure-core families + a real FSK value decoder.)*
+  **2026-06-25: the real FSK value decoder landed** (D31) — `radiotchi_fsk_sensor_decode`
+  demodulates the PCM/NRZ-with-repeat sensor subclass to **VALUES**, `analyze_capture` uses it
+  for live 2FSK, and the re-grade now re-reads the `.sub` for **OOK *or* 2FSK** rows (shared
+  `read_sub_pulses`). Host-tested + committed synthetic FSK fixture (`AA C5 3D`); on-device
+  validation pending. Remaining: a real-capture FSK regression fixture + more framings/families.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
@@ -149,6 +153,11 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   reaches VALUES via the repeating-frame detector but the waveform fingerprint is too coarse
   (it collides across the *buttons* of one remote), so it deliberately emits **no** id (D28).
   Remaining: a **firmware-Sub-GHz-decoder** integration for a genuine per-device serial on
-  non-PWM protocols (TB.1); byte-level diffs; dex UI display visual check.)*
+  non-PWM protocols (TB.1); byte-level diffs; dex UI display visual check. **2026-06-25:
+  byte-level diffs landed** (D32) — `radiotchi_byte_diff` classifies a species' aligned decoded
+  frames per byte (static=id / incrementing=counter / varying=value / absent), reconstructed from
+  each row's `.sub` (`capture_store_collect_payloads`); a new `ScreenDexDiff` (Right from the
+  captures list) renders class-only glyphs (privacy A5). Host-tested; on-device check + an
+  individual-scoped diff still pending.)*
 - **TB.3** asynchronous "ghost battles"; later a P2P channel (IR first). See
   [architecture.md](architecture.md) §7 and [open-questions.md](open-questions.md).

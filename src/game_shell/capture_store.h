@@ -16,6 +16,7 @@
 
 #include "radiotchi_types.h"
 #include "pet_growth.h"
+#include "pet_mood.h" // PetCare (persisted alongside the growth layer)
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,11 +54,16 @@ bool capture_store_load_tuning(CaptureStore* store, CaptureTuning* out);
 // Persist tuning so the next launch starts where the user left off.
 void capture_store_save_tuning(CaptureStore* store, const CaptureTuning* tuning);
 
-// Load/save the growth layer (5 stats + EXP/level/type) and the user-given name.
-// Stats are centi-units; `name` is copied up to `name_cap` (incl. NUL). load
-// returns false if no growth file exists yet (caller keeps init defaults).
-bool capture_store_load_growth(CaptureStore* store, PetGrowth* out, char* name, size_t name_cap);
-void capture_store_save_growth(CaptureStore* store, const PetGrowth* g, const char* name);
+// Load/save the growth layer (5 stats + EXP/level/type), the care/mood state (last-feed
+// time + meal quality), and the user-given name. Stats are centi-units; `name` is copied up
+// to `name_cap` (incl. NUL). `care` may be NULL (then it is not loaded/saved). load returns
+// false if no growth file exists yet (caller keeps init defaults). Back-compat: a pre-care
+// growth.txt loads its growth+name unchanged and leaves *care at pet_care_init() (never-fed
+// grace), so upgrading an existing pet does not punish it for pre-feature idle time.
+bool capture_store_load_growth(
+    CaptureStore* store, PetGrowth* out, PetCare* care, char* name, size_t name_cap);
+void capture_store_save_growth(
+    CaptureStore* store, const PetGrowth* g, const PetCare* care, const char* name);
 
 // Stream the append-only capture log. `cb` is called once per data row (header
 // skipped) with the split CSV fields; if `species_filter` is non-NULL, only rows
@@ -72,6 +78,18 @@ void capture_store_for_each_row(
     const char* species_filter,
     CaptureLogRowCb cb,
     void* ctx);
+
+// Collect up to `cap` decoded frame payloads for a species by streaming the log and re-reading
+// each matching row's `.sub` READ-ONLY, then re-demodulating it (OOK code bytes / FSK frame).
+// Rows that do not decode are skipped. Returns the number collected. Feeds radiotchi_byte_diff
+// for the diff-learning dex view. `payloads[i]` holds the i-th frame's bytes; `lens[i]` its
+// length. Privacy (A5): the caller renders byte CLASSES from the diff, never these raw bytes.
+uint8_t capture_store_collect_payloads(
+    CaptureStore* store,
+    const char* species_filter,
+    uint8_t payloads[][RADIOTCHI_DIFF_BYTES_MAX],
+    uint16_t* lens,
+    uint8_t cap);
 
 // Persist one capture. Writes the raw `.sub` from the pulse train, sets
 // ev->raw_sub_ref to its path, then appends the analysis record to the log.
@@ -92,8 +110,9 @@ bool capture_store_save(
 // rows and saved (so graduated species re-aggregate). The `.sub` files are never
 // touched. Returns the number of rows whose tier changed, or -1 on error.
 //
-// Signature-based: it raises tiers up to PROTOCOL from the stored features. Reaching
-// TIER_VALUES retroactively needs the `.sub` timing re-read and is a follow-up (TB.1).
+// It raises tiers up to PROTOCOL from the stored features (signature pass) AND, for an OOK or
+// 2FSK row that still has its `.sub`, re-reads the lossless timing READ-ONLY and re-runs the
+// real decoders to reach TIER_VALUES retroactively (the other four axes stay byte-for-byte).
 int capture_store_regrade(CaptureStore* store, SpeciesIndex* idx);
 
 #ifdef __cplusplus

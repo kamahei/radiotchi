@@ -31,8 +31,8 @@ static void scores_to_axes(const CaptureEvent* ev, float out[PET_STAT_COUNT]) {
     out[ST_MIND] = ev->scores.nourishment;
 }
 
-uint32_t pet_growth_exp_gain(const CaptureEvent* ev, uint32_t seen_count) {
-    if(ev == NULL) return 0u;
+float pet_growth_meal_quality(const CaptureEvent* ev) {
+    if(ev == NULL) return 0.0f;
     const Scores* s = &ev->scores;
 
     // Delicacy-favoring quality: low entropy (legible), high rarity + structure
@@ -40,7 +40,13 @@ uint32_t pet_growth_exp_gain(const CaptureEvent* ev, uint32_t seen_count) {
     float quality = 0.15f * s->calories + 0.15f * s->freshness +
                     0.20f * (1.0f - s->additives) + 0.25f * s->rarity +
                     0.25f * s->nourishment;
-    quality = clampf(quality, 0.0f, 1.0f);
+    return clampf(quality, 0.0f, 1.0f);
+}
+
+uint32_t pet_growth_exp_gain(const CaptureEvent* ev, uint32_t seen_count) {
+    if(ev == NULL) return 0u;
+
+    float quality = pet_growth_meal_quality(ev);
 
     // Repeat-decay: the Nth identical catch feeds less, on top of personal Rarity
     // already discounting it (anti-grind, D2). 1.0 when first-seen.
@@ -67,7 +73,8 @@ uint16_t pet_level_for_exp(uint32_t total_exp) {
     return level;
 }
 
-void pet_growth_feed(PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count) {
+void pet_growth_feed_scaled(
+    PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count, uint32_t exp_num, uint32_t exp_den) {
     if(g == NULL || ev == NULL) return;
 
     float axis[PET_STAT_COUNT];
@@ -84,9 +91,10 @@ void pet_growth_feed(PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count) 
         g->stat[i] = clampf((1.0f - alpha) * g->stat[i] + alpha * axis[i], 0.0f, 1.0f);
     }
 
-    // exp is monotonic; level is a pure function of it.
+    // exp is monotonic; level is a pure function of it. Only the exp term is scaled.
     uint16_t old_checkpoint = (uint16_t)(g->level / PET_TYPE_PERIOD);
     uint32_t gain = pet_growth_exp_gain(ev, seen_count);
+    if(exp_den != 0u) gain = (uint32_t)((uint64_t)gain * exp_num / exp_den);
     // Saturating add (total_exp is a lifelong accumulator).
     if(g->total_exp > 0xFFFFFFFFu - gain) {
         g->total_exp = 0xFFFFFFFFu;
@@ -101,6 +109,10 @@ void pet_growth_feed(PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count) 
     if(g->level >= PET_TYPE_PERIOD && new_checkpoint != old_checkpoint) {
         g->type_id = pet_type_resolve(g->stat);
     }
+}
+
+void pet_growth_feed(PetGrowth* g, const CaptureEvent* ev, uint32_t seen_count) {
+    pet_growth_feed_scaled(g, ev, seen_count, 1u, 1u);
 }
 
 // argmax over the stats, considering only indices with mask bit set. Ties go to
