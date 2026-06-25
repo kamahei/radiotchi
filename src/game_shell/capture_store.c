@@ -447,6 +447,7 @@ typedef struct {
     uint16_t* lens;
     uint8_t cap;
     uint8_t count;
+    const char* individual_filter; // NULL => all rows; else require col-15 == this tag
 } CollectCtx;
 
 static void collect_payload_row(void* ctx, const char* const* fields, int nf) {
@@ -454,6 +455,10 @@ static void collect_payload_row(void* ctx, const char* const* fields, int nf) {
     if(c->count >= c->cap || nf < 15) return;
     const char* sub_ref = fields[14];
     if(sub_ref[0] == '\0') return; // no lossless `.sub` to re-read
+    if(c->individual_filter != NULL && c->individual_filter[0] != '\0') {
+        // device-scoped: the `individual` tag is the optional column 15 (absent in old logs).
+        if(nf < 16 || strcmp(fields[15], c->individual_filter) != 0) return;
+    }
     Modulation mod = radiotchi_modulation_from_str(fields[3]);
     uint16_t len =
         decode_sub_payload(c->storage, sub_ref, mod, c->payloads[c->count], RADIOTCHI_DIFF_BYTES_MAX);
@@ -462,16 +467,27 @@ static void collect_payload_row(void* ctx, const char* const* fields, int nf) {
     c->count++;
 }
 
+uint8_t capture_store_collect_payloads_for_individual(
+    CaptureStore* store,
+    const char* species_filter,
+    const char* individual_filter,
+    uint8_t payloads[][RADIOTCHI_DIFF_BYTES_MAX],
+    uint16_t* lens,
+    uint8_t cap) {
+    if(store == NULL || payloads == NULL || lens == NULL || cap == 0) return 0;
+    CollectCtx ctx = {store->storage, payloads, lens, cap, 0, individual_filter};
+    capture_store_for_each_row(store, species_filter, collect_payload_row, &ctx);
+    return ctx.count;
+}
+
 uint8_t capture_store_collect_payloads(
     CaptureStore* store,
     const char* species_filter,
     uint8_t payloads[][RADIOTCHI_DIFF_BYTES_MAX],
     uint16_t* lens,
     uint8_t cap) {
-    if(store == NULL || payloads == NULL || lens == NULL || cap == 0) return 0;
-    CollectCtx ctx = {store->storage, payloads, lens, cap, 0};
-    capture_store_for_each_row(store, species_filter, collect_payload_row, &ctx);
-    return ctx.count;
+    return capture_store_collect_payloads_for_individual(
+        store, species_filter, NULL, payloads, lens, cap);
 }
 
 // --- re-grade pass ---------------------------------------------------------

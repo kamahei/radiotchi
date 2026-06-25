@@ -172,6 +172,7 @@ typedef struct {
     // diff-learning view: byte classes across the species' decoded captures
     ByteDiff diff;
     uint8_t diff_count; // frames compared (0/1 => "need >= 2 decoded")
+    char diff_individual[RADIOTCHI_INDIVIDUAL_LEN]; // diff scope: a device tag, or "" = species-wide
 } AppModel;
 
 typedef struct {
@@ -445,17 +446,24 @@ static void draw_detail(Canvas* canvas, const AppModel* m) {
     canvas_draw_str(canvas, 2, 55, line);
 }
 
-// Diff-learning view: one class glyph per byte position across this species' decoded captures.
-// S=static (an id/fixed field), I=incrementing (a rolling counter), V=varying (a sensor value),
-// -=absent. Privacy (A5): only the CLASS is drawn, never the raw byte value.
+static uint32_t count_distinct_individuals(const AppModel* m); // defined below
+
+// Diff-learning view: one class glyph per byte position across the decoded captures in scope
+// (a single device tag when set, else the whole species). S=static (an id/fixed field),
+// I=incrementing (a rolling counter), V=varying (a sensor value), -=absent. Privacy (A5):
+// only the CLASS is drawn, never the raw byte value.
 static void draw_diff(Canvas* canvas, const AppModel* m) {
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 11, "Learning");
     canvas_set_font(canvas, FontSecondary);
 
+    // Header names the scope: a device tag (id-XXXX) when set, else the band-level species.
     char head[28];
-    snprintf(head, sizeof(head), "%.15s x%u", m->browse_species, (unsigned)m->diff_count);
+    const char* scope = m->diff_individual[0] ? m->diff_individual : m->browse_species;
+    snprintf(head, sizeof(head), "%.15s x%u", scope, (unsigned)m->diff_count);
     canvas_draw_str(canvas, 2, 21, head);
+    // When this species holds >= 1 device tag, Left/Right step the scope (devices + species-wide).
+    if(count_distinct_individuals(m) > 0) canvas_draw_str(canvas, 106, 21, "L/R");
 
     if(m->diff_count < 2 || m->diff.width == 0) {
         canvas_draw_str(canvas, 2, 36, "Need >=2 decoded");
@@ -981,6 +989,7 @@ typedef struct {
 
 static void open_captures_for_selected(RadiotchiApp* app);
 static void open_diff_for_selected(RadiotchiApp* app);
+static void step_diff_individual(RadiotchiApp* app, int dir);
 
 // ========================= input routing ===================================
 
@@ -1218,7 +1227,11 @@ static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* runnin
         break;
 
     case ScreenDexDiff:
-        if(key == InputKeyBack && type == InputTypeShort) set_screen(app, ScreenDexCaptures);
+        if(key == InputKeyBack && type == InputTypeShort) {
+            set_screen(app, ScreenDexCaptures);
+        } else if((key == InputKeyRight || key == InputKeyLeft) && type == InputTypeShort) {
+            step_diff_individual(app, key == InputKeyRight ? +1 : -1); // cycle device / species-wide
+        }
         break;
 
 #ifdef RADIOTCHI_DEBUG
@@ -1392,14 +1405,16 @@ static void open_captures_for_selected(RadiotchiApp* app) {
     set_screen(app, ScreenDexCaptures);
 }
 
-// Diff-learning: re-read this species' captures from their `.sub`, decode each to a frame, and
-// classify byte positions (id / counter / value). Heavy I/O + decode run UNLOCKED (mirrors
+// Re-read the in-scope captures from their `.sub`, decode each to a frame, and classify byte
+// positions (id / counter / value) for the current (browse_species, diff_individual) scope —
+// a single device tag, or "" = the whole species. Heavy I/O + decode run UNLOCKED (mirrors
 // do_regrade); only the small ByteDiff result is published under the lock.
-static void open_diff_for_selected(RadiotchiApp* app) {
+static void run_diff(RadiotchiApp* app) {
+    const char* indiv = app->model.diff_individual[0] ? app->model.diff_individual : NULL;
     uint8_t payloads[DEX_DIFF_MAX][RADIOTCHI_DIFF_BYTES_MAX];
     uint16_t lens[DEX_DIFF_MAX];
-    uint8_t count = capture_store_collect_payloads(
-        app->store, app->model.browse_species, payloads, lens, DEX_DIFF_MAX);
+    uint8_t count = capture_store_collect_payloads_for_individual(
+        app->store, app->model.browse_species, indiv, payloads, lens, DEX_DIFF_MAX);
 
     const uint8_t* ptrs[DEX_DIFF_MAX];
     for(uint8_t i = 0; i < count; i++) ptrs[i] = payloads[i];
@@ -1409,5 +1424,55 @@ static void open_diff_for_selected(RadiotchiApp* app) {
     app->model.diff = diff;
     app->model.diff_count = count;
     furi_mutex_release(app->mutex);
+}
+
+// Diff-learning: scope the diff to the highlighted row's device tag (so frames of DIFFERENT
+// devices of this band-level species don't smear together), else fall back to the species-wide
+// diff (the D28 no-id case). The grouping key is the one-way id-XXXX hash (A5).
+static void open_diff_for_selected(RadiotchiApp* app) {
+    const char* want = "";
+    if(app->model.capture_sel < app->model.capture_count)
+        want = app->model.captures[app->model.capture_sel].individual;
+    strncpy(app->model.diff_individual, want, sizeof(app->model.diff_individual) - 1);
+    app->model.diff_individual[sizeof(app->model.diff_individual) - 1] = '\0';
+    run_diff(app);
     set_screen(app, ScreenDexDiff);
+}
+
+// Step the diff scope across this species' distinct device tags plus a "" species-wide slot,
+// wrapping, and re-run the diff for the new scope. No-op if there are no device tags.
+static void step_diff_individual(RadiotchiApp* app, int dir) {
+    AppModel* m = &app->model;
+    // Ordered scope list: slot 0 = "" (species-wide), then distinct id-XXXX tags in first-seen
+    // order among the loaded rows (bounded by DEX_CAPTURES_MAX; runs on the 4 KB app thread).
+    char tags[DEX_CAPTURES_MAX + 1][RADIOTCHI_INDIVIDUAL_LEN];
+    uint32_t ntags = 0;
+    tags[ntags++][0] = '\0';
+    for(uint32_t i = 0; i < m->capture_count && ntags <= DEX_CAPTURES_MAX; i++) {
+        const char* t = m->captures[i].individual;
+        if(t[0] == '\0') continue;
+        bool seen = false;
+        for(uint32_t j = 1; j < ntags; j++)
+            if(strcmp(tags[j], t) == 0) {
+                seen = true;
+                break;
+            }
+        if(seen) continue;
+        strncpy(tags[ntags], t, RADIOTCHI_INDIVIDUAL_LEN - 1);
+        tags[ntags][RADIOTCHI_INDIVIDUAL_LEN - 1] = '\0';
+        ntags++;
+    }
+    if(ntags <= 1) return; // no device tags: nothing to step through
+
+    uint32_t cur = 0;
+    for(uint32_t i = 0; i < ntags; i++)
+        if(strcmp(tags[i], m->diff_individual) == 0) {
+            cur = i;
+            break;
+        }
+    uint32_t next = (cur + (uint32_t)(dir > 0 ? 1 : (int)ntags - 1)) % ntags;
+    strncpy(m->diff_individual, tags[next], sizeof(m->diff_individual) - 1);
+    m->diff_individual[sizeof(m->diff_individual) - 1] = '\0';
+    run_diff(app);
+    view_port_update(app->view_port);
 }

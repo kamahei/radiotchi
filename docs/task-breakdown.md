@@ -157,7 +157,12 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   byte-level diffs landed** (D32) — `radiotchi_byte_diff` classifies a species' aligned decoded
   frames per byte (static=id / incrementing=counter / varying=value / absent), reconstructed from
   each row's `.sub` (`capture_store_collect_payloads`); a new `ScreenDexDiff` (Right from the
-  captures list) renders class-only glyphs (privacy A5). Host-tested; on-device check + an
-  individual-scoped diff still pending.)*
+  captures list) renders class-only glyphs (privacy A5). Host-tested; on-device check pending.
+  **2026-06-25: individual-scoped diff landed** (D34) — the diff groups a species' frames by the
+  one-way `id-XXXX` tag (pure `radiotchi_select_by_individual` + the new
+  `capture_store_collect_payloads_for_individual`), so different devices of one family no longer
+  smear to VARYING; **Left/Right** step the devices + a species-wide slot, and no-id rows fall back
+  to species-wide. Host-tested (separation + mixed-set VARYING regression); FAP builds clean;
+  on-device visual check pending.)*
 - **TB.3** asynchronous "ghost battles"; later a P2P channel (IR first). See
   [architecture.md](architecture.md) §7 and [open-questions.md](open-questions.md).

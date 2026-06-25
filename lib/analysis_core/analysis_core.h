@@ -123,6 +123,23 @@ void radiotchi_individual_fingerprint_bytes(
 // caller renders only the resulting class markers, never the raw bytes (A5).
 ByteDiff radiotchi_byte_diff(const uint8_t* const* payloads, const uint16_t* lens, uint8_t count);
 
+// Select, from `count` parallel (tag, payload) rows, the subset whose device tag matches
+// `want`, writing their payload pointers + lengths into the out arrays (capacity `cap`, order
+// preserved). `want`==NULL selects ALL rows; `want`=="" selects only UNTAGGED rows
+// (tag[0]=='\0'); otherwise an exact tag match (the one-way id-XXXX hash). Returns how many
+// matched (clamped to `cap`). Pure — lets the device-scoped diff (group a species' frames by
+// individual so different devices don't smear together) be host-tested end to end. Privacy
+// (A5): groups by the already-hashed tag; never reads a raw code.
+uint8_t radiotchi_select_by_individual(
+    const char* const* tags,
+    const uint8_t* const* payloads,
+    const uint16_t* lens,
+    uint8_t count,
+    const char* want,
+    const uint8_t** out_payloads,
+    uint16_t* out_lens,
+    uint8_t cap);
+
 // Encoding-AGNOSTIC path to VALUES: detect a CONFIRMED repeating fixed transmission by
 // finding >= 2 identical quantized frames in the pulse train. A real remote retransmits a
 // fixed frame several times per press (so frames match), while ambient noise does not repeat

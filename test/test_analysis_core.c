@@ -788,6 +788,55 @@ static void test_byte_diff(void) {
     CHECK(memcmp(&a, &b, sizeof(ByteDiff)) == 0, "byte diff is deterministic");
 }
 
+// --- individual-scoped diff (group a species' frames by device tag) ----------
+
+static void test_select_by_individual(void) {
+    printf("select by individual:\n");
+    // Two devices of one band-species: A = {fixed id 0xA1, incrementing counter},
+    // B = {fixed id 0xB7, ...}. Plus one UNTAGGED row (a D28 no-id VALUES capture).
+    const uint8_t a0[3] = {0xA1, 0x10, 0x00};
+    const uint8_t a1[3] = {0xA1, 0x11, 0x00};
+    const uint8_t b0[3] = {0xB7, 0x55, 0x00};
+    const uint8_t u0[3] = {0xC3, 0x99, 0x00};
+    const uint8_t* pay[4] = {a0, b0, a1, u0}; // interleaved, as the log might store them
+    uint16_t len[4] = {3, 3, 3, 3};
+    const char* tags[4] = {"id-aaaa", "id-bbbb", "id-aaaa", ""};
+
+    const uint8_t* out[4];
+    uint16_t ol[4];
+
+    // Device-scoped: only device A's two frames, in order.
+    uint8_t na = radiotchi_select_by_individual(tags, pay, len, 4, "id-aaaa", out, ol, 4);
+    CHECK(na == 2, "select id-aaaa => exactly device A's 2 frames");
+    CHECK(out[0] == a0 && out[1] == a1, "matched frames are in log order");
+    ByteDiff da = radiotchi_byte_diff(out, ol, na);
+    CHECK(da.cls[0] == BYTE_STATIC, "device-scoped: the id byte reads STATIC");
+    CHECK(da.cls[1] == BYTE_INCREMENTING, "device-scoped: the counter reads INCREMENTING");
+
+    // Regression guard: WITHOUT scoping, A+B's differing id bytes smear to VARYING —
+    // the exact bug device-scoping fixes (decision-log D34).
+    ByteDiff dmix = radiotchi_byte_diff(pay, len, 4);
+    CHECK(dmix.cls[0] == BYTE_VARYING, "mixed devices: the id byte mis-reads as VARYING");
+
+    // Untagged passthrough: want=="" selects only the empty-tag row.
+    uint8_t nu = radiotchi_select_by_individual(tags, pay, len, 4, "", out, ol, 4);
+    CHECK(nu == 1 && out[0] == u0, "want=\"\" => only the untagged row");
+
+    // want==NULL selects ALL rows (the species-wide path).
+    uint8_t nall = radiotchi_select_by_individual(tags, pay, len, 4, NULL, out, ol, 4);
+    CHECK(nall == 4, "want==NULL => every row (species-wide)");
+
+    // Capacity clamp: never writes past `cap`.
+    uint8_t nclamp = radiotchi_select_by_individual(tags, pay, len, 4, NULL, out, ol, 2);
+    CHECK(nclamp == 2, "cap clamps the match count");
+
+    // Determinism: re-running the same selection yields the same frames in the same order.
+    const uint8_t* o2[4];
+    uint16_t l2[4];
+    uint8_t n2 = radiotchi_select_by_individual(tags, pay, len, 4, "id-aaaa", o2, l2, 4);
+    CHECK(n2 == 2 && o2[0] == a0 && o2[1] == a1, "selection is deterministic");
+}
+
 int main(void) {
     printf("== Radiotchi analysis_core host tests ==\n");
     test_entropy();
@@ -813,6 +862,7 @@ int main(void) {
     test_fsk_noise_gate();
     test_individual_fingerprint_bytes();
     test_byte_diff();
+    test_select_by_individual();
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

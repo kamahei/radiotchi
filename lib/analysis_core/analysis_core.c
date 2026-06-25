@@ -451,6 +451,36 @@ ByteDiff radiotchi_byte_diff(const uint8_t* const* payloads, const uint16_t* len
     return d;
 }
 
+uint8_t radiotchi_select_by_individual(
+    const char* const* tags,
+    const uint8_t* const* payloads,
+    const uint16_t* lens,
+    uint8_t count,
+    const char* want,
+    const uint8_t** out_payloads,
+    uint16_t* out_lens,
+    uint8_t cap) {
+    if(tags == NULL || payloads == NULL || lens == NULL || out_payloads == NULL ||
+       out_lens == NULL || cap == 0)
+        return 0;
+    uint8_t k = 0;
+    for(uint8_t i = 0; i < count && k < cap; i++) {
+        bool match;
+        if(want == NULL) {
+            match = true; // species-wide: every row
+        } else if(want[0] == '\0') {
+            match = (tags[i] == NULL || tags[i][0] == '\0'); // untagged rows only
+        } else {
+            match = (tags[i] != NULL && strcmp(tags[i], want) == 0); // exact device tag
+        }
+        if(!match) continue;
+        out_payloads[k] = payloads[i];
+        out_lens[k] = lens[i];
+        k++;
+    }
+    return k;
+}
+
 // --- encoding-agnostic repeating-frame detector (the general VALUES path) ----
 //
 // The PWM bit decoder only reads one encoding. Real remotes use many (Manchester, PCM, ...),

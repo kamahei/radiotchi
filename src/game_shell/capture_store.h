@@ -91,6 +91,20 @@ uint8_t capture_store_collect_payloads(
     uint16_t* lens,
     uint8_t cap);
 
+// As capture_store_collect_payloads, but scoped to a single device: only rows whose
+// `individual` tag (column 15) equals `individual_filter` are collected, so frames of
+// DIFFERENT devices of one band-level species are not aligned together (the family may mix
+// frame layouts). `individual_filter`==NULL (or "") collects ALL rows — identical to
+// capture_store_collect_payloads (the species-wide fallback for the D28 no-id case).
+// Privacy (A5): groups by the one-way id-XXXX tag, never a raw code.
+uint8_t capture_store_collect_payloads_for_individual(
+    CaptureStore* store,
+    const char* species_filter,
+    const char* individual_filter,
+    uint8_t payloads[][RADIOTCHI_DIFF_BYTES_MAX],
+    uint16_t* lens,
+    uint8_t cap);
+
 // Persist one capture. Writes the raw `.sub` from the pulse train, sets
 // ev->raw_sub_ref to its path, then appends the analysis record to the log.
 // Returns true on full success. `pulses` may be NULL/0 (then only the log row is
