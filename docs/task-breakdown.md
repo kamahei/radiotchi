@@ -215,9 +215,19 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   **LFSR-8 digest** check (`radiotchi_lfsr_digest8(b,3,0x98,0xf1)==b[3]`) — `decode_acurite606` rewritten
   and confirmed on three real frames; (3) the named sensors hashed the whole (temperature-varying)
   frame for the per-device tag, minting a new individual every reading — now hash the ID byte only
-  (stable per device). Host 228 checks; real captures stay gitignored (A5). Remaining: validate the
-  FSK families (the cu8 bridge is OOK-only — FSK needs FM demod), GFSK/MSK reception, and the benign
-  input-handler mutex discipline in `radiotchi_app.c` (single-core atomic; at most a one-frame glitch).)*
+  (stable per device). **2026-06-26 (FSK): the cu8 bridge gained a 2FSK mode** (FM discriminator =
+  sign of `Im(z[i]*conj(z[i-1]))`, amplitude-gated, boxcar-smoothed to isolate the burst from IQ
+  noise) and a real **LaCrosse-TX29** (868 MHz) capture now decodes end-to-end through
+  `decode_fsk_sync_sensor` -> `sensor-2dd4-5B-c31-868`, byte-for-byte matching rtl_433 (id 10, 4.8 C,
+  CRC-8 poly 0x31 over the 5-octet frame). Three more real bugs the FSK path hid: (4) the 60us
+  glitch-coalesce ate 58us FSK bits — lowered to 24us (still kills the <=16us dips, under half a bit);
+  (5) the sync-word decoder required a confirming repeat, but real sync-framed sensors transmit a
+  SINGLE burst — added `fsk_slice_first` (sync+CRC is the guard, no repeat) while the no-CRC generic
+  FSK path keeps its repeat; (6) the bit-period was the raw-minimum run, which an onset transient pulls
+  below the true symbol and garbles the frame — now `fsk_estimate_bit_period` takes the smallest run
+  with cluster support. Host 230 checks. Remaining: a dedicated Fine Offset WH24 decoder (its longer
+  CRC+checksum frame and the crude converter's 1-bit onset alignment keep it at recognition), GFSK/MSK
+  reception, and the benign input-handler mutex discipline in `radiotchi_app.c` (single-core atomic).)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

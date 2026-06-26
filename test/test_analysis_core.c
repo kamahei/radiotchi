@@ -1032,6 +1032,28 @@ static void test_named_sensors(void) {
         "sync FSK sensor named by sync/len/crc/band");
     CHECK(strncmp(evs.individual, "id-", 3) == 0, "sync FSK sensor sets a hashed tag (A5)");
 
+    // Real-data regression (validated against a real LaCrosse-TX29 rtl_433 capture): a SINGLE
+    // (un-repeated) 0x2DD4-framed FSK burst with a 5-octet payload whose last byte is crc8/0x31 over
+    // the first four must reach VALUES — real sync-framed sensors transmit ONE burst, so the 16-bit
+    // sync + 8-bit CRC is the guard, not a confirming repeat (fsk_slice_first). A leading sub-bit
+    // onset transient (as real captures emit) must NOT pull the bit-period estimate down and garble
+    // the frame (fsk_estimate_bit_period picks the supported symbol width, not the lone minimum).
+    uint8_t lac[5] = {0x92, 0x84, 0x48, 0x6A, 0};
+    lac[4] = radiotchi_crc8(lac, 4, 0x31u, 0x00u);
+    uint8_t lframe[9] = {0xAA, 0xAA, 0x2D, 0xD4, lac[0], lac[1], lac[2], lac[3], lac[4]};
+    buf[0] = 45; // onset transient: shorter than the 100us bit, present once (no cluster support)
+    n = build_fsk_frame(buf, 1, lframe, 72, 100, 8000); // ONE frame only — no repeat
+    RawCapture rl;
+    memset(&rl, 0, sizeof(rl));
+    rl.frequency_hz = 868350000u;
+    rl.modulation = MOD_2FSK;
+    attach_pulses(&rl, buf, n);
+    CaptureEvent evl = analyze_capture(&rl, NULL, 1);
+    CHECK(evl.decode_tier == TIER_VALUES, "a single un-repeated 0x2DD4 FSK burst reaches VALUES");
+    CHECK(
+        strcmp(evl.species_id, "sensor-2dd4-5B-c31-868") == 0,
+        "single sync FSK burst named by sync/len/crc/band (LaCrosse-class)");
+
     // --- post-review false-positive / false-negative guards ---
 
     // (a) An all-zero 32-bit OOK frame must NOT be minted as a phantom Acurite (CRC-8 of zeros == 0).

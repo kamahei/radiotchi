@@ -92,7 +92,7 @@ static void analyze(const char* path) {
     // Glitch-coalesce the train (the same pre-pass the dispatch applies) so the diagnostics match
     // the verdict and a real capture's slicer dips don't desync the pair-walking PWM/PPM slicers.
     int16_t clean[RADIOTCHI_PULSES_MAX];
-    dn = radiotchi_coalesce_glitches(pulses, dn, clean, RADIOTCHI_PULSES_MAX, 60u);
+    dn = radiotchi_coalesce_glitches(pulses, dn, clean, RADIOTCHI_PULSES_MAX, 24u);
 
     // The headline verdict: the shared pulse-decode dispatch (specific decoders -> generic families).
     CaptureEvent ev;

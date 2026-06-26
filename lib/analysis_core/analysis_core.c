@@ -571,18 +571,35 @@ static bool decode_fsk_frame(
     return true;
 }
 
+// Robust NRZ bit period: the SMALLEST run magnitude that has supporting neighbors of similar width
+// (within 25%). A real frame's preamble (0xAAAA...) emits many 1-bit runs, so the true symbol width
+// always has a cluster; a lone onset transient or a clipped half-bit has no cluster and so can't pull
+// the estimate below the real period (which a plain minimum would, mis-rounding 1-bit runs to 2 and
+// garbling the frame). Falls back to the raw minimum if nothing clusters. Glitch-filtered. O(n^2),
+// n<=256. Pure.
+static uint32_t fsk_estimate_bit_period(const int16_t* pulses, uint16_t n) {
+    uint32_t best = 0, raw_min = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        uint32_t mi = abs32(pulses[i]);
+        if(mi < WV_FSK_GLITCH_US) continue;
+        if(raw_min == 0 || mi < raw_min) raw_min = mi;
+        uint16_t support = 0;
+        for(uint16_t j = 0; j < n; j++) {
+            uint32_t mj = abs32(pulses[j]);
+            if(mj < WV_FSK_GLITCH_US) continue;
+            uint32_t diff = (mj > mi) ? (mj - mi) : (mi - mj);
+            if(diff * 4u <= mi) support++; // within 25% of mi
+        }
+        if(support >= 3u && (best == 0u || mi < best)) best = mi;
+    }
+    return best != 0u ? best : raw_min;
+}
+
 bool radiotchi_fsk_sensor_decode(
     const int16_t* pulses, uint16_t n, uint8_t* frame, uint16_t cap, uint16_t* frame_len) {
     if(pulses == NULL || frame == NULL || cap == 0 || n < WV_FSK_MIN_BITS) return false;
 
-    // Bit period = the robust-minimum run (glitch-filtered); gap-scale runs are far larger,
-    // so they never pull the min down.
-    uint32_t bit_period = 0;
-    for(uint16_t i = 0; i < n; i++) {
-        uint32_t m = abs32(pulses[i]);
-        if(m < WV_FSK_GLITCH_US) continue;
-        if(bit_period == 0 || m < bit_period) bit_period = m;
-    }
+    uint32_t bit_period = fsk_estimate_bit_period(pulses, n);
     if(bit_period == 0) return false;
 
     uint16_t fcap = cap < RADIOTCHI_FSK_FRAME_MAX ? cap : RADIOTCHI_FSK_FRAME_MAX;
@@ -608,6 +625,24 @@ bool radiotchi_fsk_sensor_decode(
     // fake a frame. A real sensor payload varies. (Found by the random-pulse fuzz harness.)
     if(all_same) return false;
     for(uint16_t i = 0; i < nbytes; i++) frame[i] = f0[i];
+    if(frame_len) *frame_len = nbytes;
+    return true;
+}
+
+// Slice only the FIRST NRZ frame to bytes — NO confirming repeat required. The sync-word path uses
+// this because its 16-bit sync + 8-bit CRC is the integrity guard, and real sync-framed sensors
+// (e.g. LaCrosse-TX29) transmit a single burst that a repeat requirement would wrongly reject. The
+// generic no-CRC FSK path still demands a repeat (its only guard) via radiotchi_fsk_sensor_decode.
+static bool fsk_slice_first(
+    const int16_t* pulses, uint16_t n, uint8_t* frame, uint16_t cap, uint16_t* frame_len) {
+    if(pulses == NULL || frame == NULL || cap == 0 || n < WV_FSK_MIN_BITS) return false;
+    uint32_t bit_period = fsk_estimate_bit_period(pulses, n);
+    if(bit_period == 0) return false;
+    uint16_t fcap = cap < RADIOTCHI_FSK_FRAME_MAX ? cap : RADIOTCHI_FSK_FRAME_MAX;
+    uint16_t nb = 0, next = 0;
+    if(!decode_fsk_frame(pulses, n, 0, bit_period, frame, fcap, &nb, &next)) return false;
+    uint16_t nbytes = (uint16_t)((nb + 7u) / 8u);
+    if(nbytes > fcap) nbytes = fcap;
     if(frame_len) *frame_len = nbytes;
     return true;
 }
@@ -829,7 +864,10 @@ uint32_t radiotchi_bits_get(
     return v;
 }
 
-#define WV_COALESCE_GLITCH_US 60u // dispatch pre-pass: drop sub-60us spikes (< every real bit unit)
+// Dispatch pre-pass: drop sub-24us spikes. Real slicer/IQ dips seen in captures are <=16us (Acurite
+// ~4us, LaCrosse onset ~16us); the shortest real bit unit is ~58us (17kbps FSK), so 24us sits well
+// under half a bit and never merges genuine symbols.
+#define WV_COALESCE_GLITCH_US 24u
 
 uint16_t radiotchi_coalesce_glitches(
     const int16_t* in, uint16_t n, int16_t* out, uint16_t cap, uint16_t glitch_us) {
@@ -1379,7 +1417,8 @@ static bool
 static bool decode_fsk_sync_sensor(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
     uint8_t f[RADIOTCHI_FSK_FRAME_MAX];
     uint16_t flen = 0;
-    if(!radiotchi_fsk_sensor_decode(pulses, n, f, sizeof(f), &flen)) return false;
+    // Single-frame slice (sync + CRC is the guard, not a repeat -> single-burst sensors decode).
+    if(!fsk_slice_first(pulses, n, f, sizeof(f), &flen)) return false;
     uint16_t nbits = (uint16_t)(flen * 8u);
     int32_t doff = radiotchi_find_sync(f, flen, nbits, WV_FSK_SYNC, WV_FSK_SYNC_BITS);
     if(doff < 0) return false;
