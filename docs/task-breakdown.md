@@ -205,9 +205,19 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   rows, which the offline dispatch would downgrade), re-applies the brand remap to reconcile old
   `Star Line`-style species, and rewrites on any field change (not just tier); the diff collector
   `decode_sub_payload` is now SPECIES-DIRECTED (ppm/manchester/pwm/fsk per family) so PPM/Manchester
-  species populate the learning view. Remaining: confirm named protocols on real captures, GFSK/MSK
-  reception, and the benign input-handler mutex discipline in `radiotchi_app.c` (single-core atomic;
-  at most a one-frame visual glitch).)*
+  species populate the learning view. **2026-06-26: the named OOK decoders are now validated against
+  REAL data** — `tools/rtl433_cu8_to_sub.py` bridges the rtl_433_tests corpus (cu8 IQ -> magnitude
+  threshold -> Flipper `.sub`, OOK only) so real **Acurite-606** and **Nexus-TH** captures run through
+  the pure core. This broke the synthetic circularity and found real bugs: (1) real RX/IQ slicers emit
+  sub-us glitches that split a pulse and desync the pair-walking PWM/PPM slicers — fixed by a
+  `radiotchi_coalesce_glitches` pre-pass at the dispatch entry (no-op on clean frames); (2) **Acurite-606
+  was a fiction** (assumed mark-PWM + CRC-8); the REAL coding is gap/PPM, sync-gap-framed, with an
+  **LFSR-8 digest** check (`radiotchi_lfsr_digest8(b,3,0x98,0xf1)==b[3]`) — `decode_acurite606` rewritten
+  and confirmed on three real frames; (3) the named sensors hashed the whole (temperature-varying)
+  frame for the per-device tag, minting a new individual every reading — now hash the ID byte only
+  (stable per device). Host 228 checks; real captures stay gitignored (A5). Remaining: validate the
+  FSK families (the cu8 bridge is OOK-only — FSK needs FM demod), GFSK/MSK reception, and the benign
+  input-handler mutex discipline in `radiotchi_app.c` (single-core atomic; at most a one-frame glitch).)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
