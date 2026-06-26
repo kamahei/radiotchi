@@ -413,7 +413,9 @@ bool radiotchi_manchester_decode(
 // each polarity separately fixes that. A lone onset/glitch run has no cluster and can't drag the
 // estimate down. Falls back to the raw minimum. O(n^2), n<=256. Pure.
 static uint32_t man_half_for(const int16_t* pulses, uint16_t n, bool want_mark) {
-    uint32_t best = 0, raw = 0;
+    // Pass 1: the raw minimum and the strongest cluster support of this polarity.
+    uint32_t raw = 0;
+    uint16_t maxsup = 0;
     for(uint16_t i = 0; i < n; i++) {
         if((pulses[i] > 0) != want_mark) continue;
         uint32_t mi = abs32(pulses[i]);
@@ -427,7 +429,30 @@ static uint32_t man_half_for(const int16_t* pulses, uint16_t n, bool want_mark) 
             uint32_t d = (mj > mi) ? (mj - mi) : (mi - mj);
             if(d * 4u <= mi) support++; // within 25% of mi
         }
-        if(support >= 3u && (best == 0u || mi < best)) best = mi;
+        if(support > maxsup) maxsup = support;
+    }
+    if(raw == 0u) return 0;
+    // Threshold the support at a quarter of the dominant cluster: a real frame's half-bit is a
+    // dominant cluster (the preamble + data supply many), so a sparse sub-half-bit noise cluster
+    // (seen in real captures) can't pull the estimate below the true width. Pass 2 takes the SMALLEST
+    // run that still meets the threshold.
+    uint16_t thr = (uint16_t)(maxsup / 4u);
+    if(thr < 3u) thr = 3u;
+    uint32_t best = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        if((pulses[i] > 0) != want_mark) continue;
+        uint32_t mi = abs32(pulses[i]);
+        if(mi < WV_MAN_GLITCH_US) continue;
+        if(best != 0u && mi >= best) continue; // only smaller candidates can improve the answer
+        uint16_t support = 0;
+        for(uint16_t j = 0; j < n; j++) {
+            if((pulses[j] > 0) != want_mark) continue;
+            uint32_t mj = abs32(pulses[j]);
+            if(mj < WV_MAN_GLITCH_US) continue;
+            uint32_t d = (mj > mi) ? (mj - mi) : (mi - mj);
+            if(d * 4u <= mi) support++;
+        }
+        if(support >= thr) best = mi;
     }
     return best != 0u ? best : raw;
 }
@@ -1601,6 +1626,7 @@ static bool decode_nexus_th(uint32_t band, const int16_t* pulses, uint16_t n, Ca
 // -> "weather-oregon-433"; the device_id only seeds the one-way per-device tag (A5), values are never
 // surfaced. Pure, libm-free.
 #define ORE_SAMP_MAX 512u
+#define ORE_MIN_SAMP 120u // a real burst is >= this many half-bit samples (else it is noise)
 #define ORE_BIT(arr, i) (((arr)[(i) >> 3] >> (7u - ((i) & 7u))) & 1u)
 
 // Reverse the bit order within each of the two nibbles of a byte (rtl_433 reflect_nibbles).
@@ -1641,29 +1667,30 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
     uint32_t gap = space_half * WV_MAN_GAP_MULT;
     if(gap < WV_MAN_GAP_FLOOR) gap = WV_MAN_GAP_FLOOR;
 
-    // Outer Manchester -> half-bit sample stream (packed, MSB-first), first frame only.
+    // Outer Manchester -> half-bit sample stream (packed, MSB-first). Scan past leading noise: a gap
+    // or an anomalous (>2.5 half-bit) run is a frame boundary — if we have already gathered a
+    // long-enough burst we are done, otherwise the fragment was noise so reset and keep scanning.
     uint8_t samp[ORE_SAMP_MAX / 8u];
     memset(samp, 0, sizeof(samp));
     uint16_t m = 0;
-    bool started = false;
     for(uint16_t i = 0; i < n && m < ORE_SAMP_MAX; i++) {
         uint32_t mag = abs32(pulses[i]);
         if(mag < WV_MAN_GLITCH_US) continue;
-        if(mag >= gap) {
-            if(started) break;
-            continue;
-        }
         uint8_t level = (pulses[i] > 0) ? 1u : 0u;
         uint32_t half = level ? mark_half : space_half;
-        uint32_t q = (mag < (half * 3u) / 2u) ? 1u : ((mag < half * 3u) ? 2u : 0u);
-        if(q == 0u) return false; // not clean Manchester
-        started = true;
+        if(mag >= gap || mag >= half * 3u) { // frame boundary / anomalous run
+            if(m >= ORE_MIN_SAMP) break; // a long-enough burst captured
+            if(m > 0u) memset(samp, 0, sizeof(samp)); // short fragment was noise -> reset and rescan
+            m = 0;
+            continue;
+        }
+        uint32_t q = (mag < (half * 3u) / 2u) ? 1u : 2u; // 1 or 2 half-bits
         for(uint32_t r = 0; r < q && m < ORE_SAMP_MAX; r++) {
             if(level) samp[m >> 3] |= (uint8_t)(0x80u >> (m & 7u));
             m++;
         }
     }
-    if(m < 64u) return false;
+    if(m < ORE_MIN_SAMP) return false;
 
     // Phase-pair the samples into the chip stream b (low->high = 1); the correct framing pairs every
     // (a,b) as a transition, so take the phase with the longer unbroken run.
@@ -1696,9 +1723,16 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
     }
     if(P == 0u) return false;
 
-    // Known Oregon v2.1 temperature sensors: sensor_id -> checksum nibble index.
-    static const uint16_t ore_ids[] = {0xEC40u, 0xCC43u}; // THN132N, THN129 (temp-only, 12-nibble cksum)
-    static const int ore_idx[] = {12, 12};
+    // Known Oregon v2.1 sensors -> {sensor_id, checksum nibble index, species}. Temp-only and
+    // temp+humidity are distinct dex species. Each entry is real-validated against an rtl_433 capture.
+    static const struct {
+        uint16_t id;
+        int cidx;
+        const char* species;
+    } ore_tab[] = {
+        {0xEC40u, 12, "weather-oregon-433"}, // THN132N: temperature only
+        {0x1D20u, 15, "th-oregon-433"}, // THGR122N: temperature + humidity
+    };
 
     for(uint16_t off = P; off <= (uint16_t)(P + 20u) && (uint16_t)(off + 2u) < blen; off++) {
         // Inner Manchester (high->low = 1) -> message bits -> reflected nibbles.
@@ -1716,15 +1750,17 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
         for(uint16_t i = 0; i < mbytes; i++) msg[i] = ore_reflect_nibbles(msg[i]);
 
         uint16_t sid = (uint16_t)((msg[0] << 8) | msg[1]);
-        for(size_t t = 0; t < sizeof(ore_ids) / sizeof(ore_ids[0]); t++) {
-            if(sid != ore_ids[t]) continue;
-            int idx = ore_idx[t];
-            if((uint16_t)((idx + 2) / 2) > mbytes) continue;
+        for(size_t t = 0; t < sizeof(ore_tab) / sizeof(ore_tab[0]); t++) {
+            if(sid != ore_tab[t].id) continue;
+            int idx = ore_tab[t].cidx;
+            // Highest byte the checksum reads: msg[idx>>1] (+ msg[(idx+1)>>1] for an odd index).
+            uint16_t need = (uint16_t)((idx >> 1) + ((idx & 1) ? 2 : 1));
+            if(need > mbytes) continue;
             if(!ore_checksum_ok(msg, idx)) continue;
             ev->decode_tier = TIER_VALUES;
             strncpy(ev->protocol, "Oregon-v2", sizeof(ev->protocol) - 1);
             ev->protocol[sizeof(ev->protocol) - 1] = '\0';
-            strncpy(ev->species_id, "weather-oregon-433", sizeof(ev->species_id) - 1);
+            strncpy(ev->species_id, ore_tab[t].species, sizeof(ev->species_id) - 1);
             ev->species_id[sizeof(ev->species_id) - 1] = '\0';
             // Per-device tag = sensor type + house code only (A5); BCD values are never surfaced.
             uint8_t idbytes[3] = {msg[0], msg[1], (uint8_t)((msg[2] & 0x0fu) | (msg[3] & 0xf0u))};

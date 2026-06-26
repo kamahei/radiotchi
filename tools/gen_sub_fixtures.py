@@ -180,6 +180,16 @@ def main():
     f = oregon_v2_frame(om)
     write_sub(os.path.join(out_dir, "oregon_thn132n_433.sub"), 433920000, ook, [f, f])
 
+    # Oregon THGR122N (v2.1 temp+humidity): sensor_id 0x1D20, a 15-nibble (odd) sum check spanning
+    # bytes 7-8 -> th-oregon-433 (a distinct species from the temp-only THN132N). Synthetic id 0x33,
+    # 22.5 C, 60%. Real coding validated against an rtl_433 THGR122N capture.
+    om2 = [0x1D, 0x20, 0x23, 0x30, 0x52, 0x20, 0x06, 0x00, 0x00]
+    s2 = sum((b >> 4) + (b & 0xF) for b in om2[:7]) & 0xFF  # nibbles of bytes 0..6
+    om2[7] = s2 & 0x0F  # low nibble carries the sum's low nibble (high nibble 0 adds nothing)
+    om2[8] = s2 & 0xF0  # high nibble carries the sum's high nibble
+    f = oregon_v2_frame(om2)
+    write_sub(os.path.join(out_dir, "oregon_thgr122n_433.sub"), 433920000, ook, [f, f])
+
     # Generic CRC FSK sensor: 5 bytes, byte 4 = CRC-8/0x31 over bytes 0..3 -> sensor-fsk-5B-c31-868.
     s = bytes([0xA1, 0xB2, 0xC3, 0xD4, 0x00])
     s = bytes(s[:4]) + bytes([crc8(s[:4], poly=0x31)])

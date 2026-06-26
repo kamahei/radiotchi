@@ -236,12 +236,19 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   Manchester-encoded, then nibbles bit-reversed), checked by a nibble-sum checksum (not a CRC). The
   decoder slices the outer Manchester, finds the preamble end, and over a small offset window runs the
   inner Manchester + reflect + checksum, accepting only a known `sensor_id` with a valid checksum ->
-  `weather-oregon-433` (id in the hashed tag, A5). VALIDATED against the real THN132N capture (id 231,
-  ch 4, 18.0 C, byte-exact to rtl_433) and covered by a committed synthetic fixture. Host 233 checks.
-  Remaining: more Oregon models (the decoder is table-driven on sensor_id), a dedicated Fine Offset
-  WH24 decoder (its longer CRC+checksum frame and the crude converter's 1-bit onset alignment keep it
-  at recognition), GFSK/MSK reception, and the benign input-handler mutex discipline in
-  `radiotchi_app.c` (single-core atomic).)*
+  the matched type's species (id in the hashed tag, A5). VALIDATED byte-exact against two real rtl_433
+  captures giving TWO distinct species: **THN132N** (temp only, id 231, 18.0 C) -> `weather-oregon-433`
+  and **THGR122N** (temp+humidity, id 248, 18.8 C, 54%) -> `th-oregon-433`. The noisier THGR122N
+  surfaced two more real robustness gaps, both fixed: the half-bit estimator (`man_half_for`) was the
+  smallest cluster with >=3 support, which a sparse SUB-half-bit noise cluster could win — now it
+  thresholds support at a quarter of the dominant cluster; and `decode_oregon_v2` now scans PAST
+  leading noise (resetting on short fragments) instead of aborting on the first anomalous run. The
+  cu8->sub converter also gained glitch-coalescing (a hard magnitude threshold splits a pulse on every
+  1-sample dip, inflating the raw count so a real burst overflowed the 256-pulse buffer; real CC1101
+  hysteresis does not). Both species are covered by committed synthetic fixtures. Host 235 checks.
+  Remaining: more Oregon models (table-driven on sensor_id), a dedicated Fine Offset WH24 decoder (its
+  longer CRC+checksum frame and the crude converter's 1-bit onset alignment keep it at recognition),
+  GFSK/MSK reception, and the benign input-handler mutex discipline in `radiotchi_app.c`.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

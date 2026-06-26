@@ -48,6 +48,22 @@ def _rle(levels, us_per):
     return pulses
 
 
+def _coalesce(pulses, glitch_us):
+    """Drop sub-`glitch_us` runs and merge same-sign neighbours (mirrors radiotchi_coalesce_glitches).
+    A hard magnitude threshold splits a pulse on every 1-sample dip, inflating the raw pulse count so a
+    real burst can overflow the device's 256-pulse buffer; a real CC1101 slicer (with hysteresis) does
+    not. Cleaning these here keeps the .sub representative."""
+    out = []
+    for v in pulses:
+        if abs(v) < glitch_us:
+            continue
+        if out and (out[-1] < 0) == (v < 0):
+            out[-1] = _clamp(out[-1] + v)
+        else:
+            out.append(v)
+    return out
+
+
 def cu8_to_sub(path_in, path_out, freq=433920000, rate=250000, thr_frac=0.4, mode="ook", invert=False):
     with open(path_in, "rb") as fh:
         data = fh.read()
@@ -102,7 +118,8 @@ def cu8_to_sub(path_in, path_out, freq=433920000, rate=250000, thr_frac=0.4, mod
         levels = [mag2[i] > thr for i in range(n)]
         preset = "FuriHalSubGhzPresetOok650Async"
 
-    pulses = _rle(levels, us_per)
+    # Merge the 1-2 sample glitches the hard threshold introduces (>= ~2 samples kept).
+    pulses = _coalesce(_rle(levels, us_per), max(8, int(round(2 * us_per))))
 
     with open(path_out, "w", newline="\n") as fh:
         fh.write("Filetype: Flipper SubGhz RAW File\nVersion: 1\n")
