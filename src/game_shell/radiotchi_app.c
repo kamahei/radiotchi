@@ -254,8 +254,7 @@ static void species_row_text(void* ctx, uint32_t i, char* out, size_t out_len) {
     const SpeciesRecord* r = species_index_get(app->index, i);
     if(r == NULL) return;
     char id[18];
-    strncpy(id, r->species_id, sizeof(id) - 1);
-    id[sizeof(id) - 1] = '\0';
+    radiotchi_species_label(r->species_id, id, sizeof(id)); // friendly dex name (display only)
     snprintf(out, out_len, "%s%s x%lu", (r->count <= 1 ? "*" : " "), id, (unsigned long)r->count);
 }
 

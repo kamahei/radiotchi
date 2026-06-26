@@ -33,11 +33,16 @@ $(BUILD)/test_pet_quests: test_pet_quests.c $(GAME)/pet_quests.c $(GAME)/pet_gro
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -I$(CORE) -I$(GAME) $^ -o $@
 
-test: $(BUILD)/test_analysis_core $(BUILD)/test_pet_growth $(BUILD)/test_pet_mood $(BUILD)/test_pet_quests
+$(BUILD)/test_labels: test_labels.c $(GAME)/radiotchi_labels.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -I$(CORE) -I$(GAME) $^ -o $@
+
+test: $(BUILD)/test_analysis_core $(BUILD)/test_pet_growth $(BUILD)/test_pet_mood $(BUILD)/test_pet_quests $(BUILD)/test_labels
 	./$(BUILD)/test_analysis_core
 	./$(BUILD)/test_pet_growth
 	./$(BUILD)/test_pet_mood
 	./$(BUILD)/test_pet_quests
+	./$(BUILD)/test_labels
 
 clean:
 	rm -rf $(BUILD)
