@@ -88,8 +88,10 @@ static void test_mood(void) {
     CHECK(c.last_meal_quality < PET_DELICACY_QUALITY, "junk is remembered as low quality");
     CHECK(pet_mood(&c, BASE) == MOOD_HAPPY, "fresh ordinary meal => HAPPY");
 
-    // Time passing: HUNGRY past FULL, NEGLECTED past NEGLECT.
-    CHECK(pet_mood(&c, BASE + PET_HUNGER_FULL_SECS) == MOOD_HUNGRY, "past FULL_SECS => HUNGRY");
+    // Time passing: HUNGRY past FULL, NEGLECTED past NEGLECT. At exactly FULL the pet is not yet
+    // hungry — consistent with pet_hunger (which is 0 at FULL and rises only past it).
+    CHECK(pet_mood(&c, BASE + PET_HUNGER_FULL_SECS) != MOOD_HUNGRY, "at FULL_SECS => not yet HUNGRY");
+    CHECK(pet_mood(&c, BASE + PET_HUNGER_FULL_SECS + 1u) == MOOD_HUNGRY, "past FULL_SECS => HUNGRY");
     CHECK(pet_mood(&c, BASE + PET_NEGLECT_SECS) == MOOD_NEGLECTED, "past NEGLECT_SECS => NEGLECTED");
 }
 

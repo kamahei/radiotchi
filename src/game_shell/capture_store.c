@@ -50,8 +50,10 @@ static const char* preset_to_string(FuriHalSubGhzPreset p) {
     }
 }
 
-static void file_write_str(File* f, const char* s) {
-    storage_file_write(f, s, strlen(s));
+// Returns true only if the whole string was written (a short write = full card / I/O error).
+static bool file_write_str(File* f, const char* s) {
+    size_t len = strlen(s);
+    return storage_file_write(f, s, len) == len;
 }
 
 // --- lifecycle -------------------------------------------------------------
@@ -192,11 +194,13 @@ bool capture_store_load_growth(
         // Optional "care=<last_feed_time> <last_meal_quality>" line. Absent in pre-care files,
         // which then keep the never-fed grace set above (no false starvation on upgrade).
         if(ok && care != NULL) {
-            const char* p = strstr(buf, "care=");
+            // Anchor to the line start ("\ncare=") so a user pet name containing "care=" (the name
+            // line precedes this one) can't be mis-read as the care record.
+            const char* p = strstr(buf, "\ncare=");
             if(p != NULL) {
                 unsigned long long lft = 0;
                 unsigned q = 0;
-                if(sscanf(p + 5, "%llu %u", &lft, &q) >= 1) {
+                if(sscanf(p + 6, "%llu %u", &lft, &q) >= 1) {
                     care->last_feed_time = (uint64_t)lft;
                     care->last_meal_quality = (uint8_t)(q > 100u ? 100u : q);
                 }
@@ -205,12 +209,12 @@ bool capture_store_load_growth(
         // Optional "quest=<total> <delicacy> <decoded> <species> <streak> <best> <last> <mask>"
         // line. Absent in pre-quest files, which keep the fresh pet_quests_init above.
         if(ok && quests != NULL) {
-            const char* p = strstr(buf, "quest=");
+            const char* p = strstr(buf, "\nquest="); // line-anchored (see care= above)
             if(p != NULL) {
                 unsigned long tf = 0, df = 0, dc = 0, sp = 0, mask = 0;
                 unsigned fs = 0, bs = 0;
                 unsigned long long lft = 0;
-                if(sscanf(p + 6, "%lu %lu %lu %lu %u %u %llu %lu", &tf, &df, &dc, &sp, &fs, &bs, &lft, &mask) ==
+                if(sscanf(p + 7, "%lu %lu %lu %lu %u %u %llu %lu", &tf, &df, &dc, &sp, &fs, &bs, &lft, &mask) ==
                    8) {
                     quests->total_feeds = (uint32_t)tf;
                     quests->delicacy_feeds = (uint32_t)df;
@@ -383,12 +387,12 @@ static bool append_log_row(CaptureStore* store, const CaptureEvent* ev) {
         (double)ev->scores.nourishment,
         ev->raw_sub_ref,
         ev->individual);
-    file_write_str(f, furi_string_get_cstr(row));
+    bool ok = file_write_str(f, furi_string_get_cstr(row)); // report a short write (full card)
     furi_string_free(row);
 
     storage_file_close(f);
     storage_file_free(f);
-    return true;
+    return ok;
 }
 
 // --- capture log streaming reader ------------------------------------------
@@ -544,27 +548,30 @@ static uint16_t read_sub_pulses(Storage* storage, const char* sub_path, int16_t*
     File* f = storage_file_alloc(storage);
     uint16_t pc = 0;
     if(storage_file_open(f, sub_path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        // Accumulate each physical line in a heap FuriString: a RAW_Data line holds up to
+        // SUB_RAW_LINE_VALUES (~3.5 KB), far larger than any fixed stack buffer we could afford on
+        // the 4 KB FAP stack — and radiotchi_parse_raw_data requires the whole "RAW_Data:" line per
+        // call, so we must not split one. (A 256-byte buffer used to flush mid-line, which dropped
+        // the prefix-less remainder and recovered only ~36 of the line's pulses.)
         char chunk[256];
-        char line[256];
-        size_t line_len = 0;
+        FuriString* line = furi_string_alloc();
         size_t n;
         while(pc < cap && (n = storage_file_read(f, chunk, sizeof(chunk))) > 0) {
             for(size_t i = 0; i < n; i++) {
                 char c = chunk[i];
-                if(c == '\n' || line_len >= sizeof(line) - 1) {
-                    line[line_len] = '\0';
-                    pc = radiotchi_parse_raw_data(line, pulses, cap, pc);
-                    line_len = 0;
+                if(c == '\n') {
+                    pc = radiotchi_parse_raw_data(furi_string_get_cstr(line), pulses, cap, pc);
+                    furi_string_reset(line);
                     if(pc >= cap) break;
                 } else if(c != '\r') {
-                    line[line_len++] = c;
+                    furi_string_push_back(line, c);
                 }
             }
         }
-        if(line_len > 0 && pc < cap) { // a final line with no newline
-            line[line_len] = '\0';
-            pc = radiotchi_parse_raw_data(line, pulses, cap, pc);
+        if(pc < cap && furi_string_size(line) > 0) { // a final line with no trailing newline
+            pc = radiotchi_parse_raw_data(furi_string_get_cstr(line), pulses, cap, pc);
         }
+        furi_string_free(line);
     }
     storage_file_close(f);
     storage_file_free(f);
@@ -660,39 +667,52 @@ int capture_store_regrade(CaptureStore* store, SpeciesIndex* idx) {
     if(storage_file_open(in, RADIOTCHI_LOG_PATH, FSAM_READ, FSOM_OPEN_EXISTING) &&
        storage_file_open(out, RADIOTCHI_LOG_TMP, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
         changed = 0;
+        bool ok = true; // every write to the temp must succeed or we must NOT swap it in
         if(idx) species_index_clear(idx); // rebuild it from the re-graded rows
-        file_write_str(
+        ok = file_write_str(
             out,
             "epoch,datetime,frequency_hz,modulation,rssi_dbm,bit_count,entropy,"
             "decode_tier,species_id,calories,freshness,additives,rarity,nourishment,"
             "raw_sub_ref,individual\n");
 
+        // Accumulate each physical CSV row in a heap FuriString (no fixed 256-byte buffer that
+        // would split — and silently drop a byte from — a longer row when rewriting the
+        // authoritative log).
         FuriString* emit = furi_string_alloc();
+        FuriString* line = furi_string_alloc();
         char chunk[256];
-        char line[256];
-        size_t line_len = 0;
         bool header_skipped = false;
         size_t n;
-        while((n = storage_file_read(in, chunk, sizeof(chunk))) > 0) {
+        while(ok && (n = storage_file_read(in, chunk, sizeof(chunk))) > 0) {
             for(size_t i = 0; i < n; i++) {
                 char c = chunk[i];
-                if(c == '\n' || line_len >= sizeof(line) - 1) {
-                    line[line_len] = '\0';
-                    if(line_len > 0) {
+                if(c == '\n') {
+                    if(furi_string_size(line) > 0) {
                         if(!header_skipped) {
                             header_skipped = true; // drop the original header
                         } else {
-                            if(regrade_row(store->storage, line, idx, emit)) changed++;
-                            file_write_str(out, furi_string_get_cstr(emit));
+                            if(regrade_row(store->storage, furi_string_get_cstr(line), idx, emit))
+                                changed++;
+                            if(!file_write_str(out, furi_string_get_cstr(emit))) {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    line_len = 0;
+                    furi_string_reset(line);
                 } else if(c != '\r') {
-                    line[line_len++] = c;
+                    furi_string_push_back(line, c);
                 }
             }
         }
+        // A final data row with no trailing newline (e.g. after a previously truncated append).
+        if(ok && header_skipped && furi_string_size(line) > 0) {
+            if(regrade_row(store->storage, furi_string_get_cstr(line), idx, emit)) changed++;
+            if(!file_write_str(out, furi_string_get_cstr(emit))) ok = false;
+        }
+        furi_string_free(line);
         furi_string_free(emit);
+        if(!ok) changed = -1; // a write failed: abort the swap, keep the original log intact
     }
 
     storage_file_close(in);
@@ -700,7 +720,7 @@ int capture_store_regrade(CaptureStore* store, SpeciesIndex* idx) {
     storage_file_close(out);
     storage_file_free(out);
 
-    if(changed < 0) { // could not open one of the files
+    if(changed < 0) { // could not open a file, or a temp write failed — keep the original log
         storage_common_remove(store->storage, RADIOTCHI_LOG_TMP);
         return -1;
     }

@@ -33,7 +33,7 @@ PetMood pet_mood(const PetCare* c, uint64_t now) {
     if(c == NULL || c->last_feed_time == 0u) return MOOD_NEUTRAL;
     uint64_t e = elapsed_since_feed(c, now);
     if(e >= PET_NEGLECT_SECS) return MOOD_NEGLECTED;
-    if(e >= PET_HUNGER_FULL_SECS) return MOOD_HUNGRY;
+    if(e > PET_HUNGER_FULL_SECS) return MOOD_HUNGRY; // hunger starts AFTER FULL (matches pet_hunger)
     // Recently fed: a delicacy leaves it content, an ordinary meal merely happy.
     if(c->last_meal_quality >= PET_DELICACY_QUALITY) return MOOD_CONTENT;
     return MOOD_HAPPY;

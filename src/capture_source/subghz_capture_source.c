@@ -269,8 +269,14 @@ bool subghz_capture_source_search(
     }
 
     if(best_freq == 0 || sampled == 0) return false;
-    // Ambient noise floor estimate for the relative-detection gate in next().
-    src->noise_floor_dbm = (int16_t)(rssi_sum / (float)sampled);
+    // Ambient noise floor for the relative-detection gate in next(): the mean of the NON-winning
+    // samples. Including the strongest sample (the candidate signal) biases the floor up by ~1/N and,
+    // for a single-frequency plan, makes floor == best so `best - floor >= margin` can NEVER clear —
+    // a single-frequency sweep could never capture. With only one sample there is no ambient
+    // estimate, so use a sentinel far below any real RSSI: the relative gate becomes a no-op and the
+    // absolute threshold alone decides.
+    src->noise_floor_dbm =
+        (sampled > 1) ? (int16_t)((rssi_sum - best_rssi) / (float)(sampled - 1)) : (int16_t)(-200);
     src->last_best_rssi_dbm = (int16_t)best_rssi;
     if(out_freq != NULL) *out_freq = best_freq;
     if(out_rssi != NULL) *out_rssi = (int16_t)best_rssi;

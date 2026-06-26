@@ -737,7 +737,7 @@ bool radiotchi_repeating_frame(const int16_t* pulses, uint16_t n, uint16_t* fp) 
     int8_t buf[WV_FRAME_PREFIX + 1]; // sync header (buf[0]) + canonical (buf[1..PREFIX])
     int blen = 0; // total elements in the current frame (only first PREFIX+1 are buffered)
 
-    for(uint16_t i = 0; i <= n; i++) {
+    for(uint32_t i = 0; i <= n; i++) { // uint32 index: `i <= n` would never terminate at n==UINT16_MAX
         bool boundary = (i == n); // flush the final frame at the end
         uint32_t mag = 0;
         if(!boundary) {
@@ -821,8 +821,8 @@ int32_t radiotchi_find_sync(
     if(bytes == NULL || sync_nbits == 0 || sync_nbits > 32 || nbits < sync_nbits) return -1;
     uint32_t mask = (sync_nbits == 32u) ? 0xFFFFFFFFu : ((1u << sync_nbits) - 1u);
     uint32_t want = sync & mask;
-    for(uint16_t off = 0; (uint16_t)(off + sync_nbits) <= nbits; off++) {
-        if((radiotchi_bits_get(bytes, nbytes, off, sync_nbits) & mask) == want) {
+    for(uint32_t off = 0; off + sync_nbits <= nbits; off++) { // uint32: no off+sync wrap near UINT16_MAX
+        if((radiotchi_bits_get(bytes, nbytes, (uint16_t)off, sync_nbits) & mask) == want) {
             return (int32_t)(off + sync_nbits);
         }
     }
@@ -1537,8 +1537,11 @@ CaptureEvent analyze_capture(
         // device decoders first, then the generic fixed-code / sensor families -> TIER_VALUES.
         // Privacy (A5): species stay family/brand-level; any decoded code only justifies the tier
         // and a one-way per-device tag. (Same path the `.sub` re-grade uses, so results match.)
-        radiotchi_decode_from_pulses(
-            raw->frequency_hz, raw->modulation, raw->pulses, raw->pulse_count, &ev);
+        // Clamp the pulse count to the in-struct array bound (mirrors the payload clamp above), so a
+        // mis-filled RawCapture can never read past raw->pulses[].
+        uint16_t pc = raw->pulse_count;
+        if(pc > RADIOTCHI_PULSES_MAX) pc = RADIOTCHI_PULSES_MAX;
+        radiotchi_decode_from_pulses(raw->frequency_hz, raw->modulation, raw->pulses, pc, &ev);
     }
 
     // Carry the raw .sub reference across the boundary so the Game Shell can link
