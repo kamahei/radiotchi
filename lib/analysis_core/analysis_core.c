@@ -1070,6 +1070,30 @@ static bool
     return true;
 }
 
+// Named device decoder — Acurite 606TX outdoor thermometer (433.92 MHz OOK PWM). Documented
+// public layout: a 32-bit frame [id:8][flags:8][temp:8 (+4 high bits in flags)][crc:8] whose last
+// byte is CRC-8 (generator 0x07, init 0) over the first three. We gate on the exact length AND a
+// valid CRC over the documented region — a documented signature, not a guess — so a non-Acurite
+// frame practically never matches (the CRC must hold over exactly those 3 bytes). Reaches VALUES /
+// "weather-acurite-433"; the id lives only in the hashed `individual` tag (A5). We never surface
+// the decoded temperature, so the field math is irrelevant to what the dex shows. Pure.
+static bool decode_acurite606(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    if(band != 433u) return false;
+    uint8_t f[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t nbits = 0;
+    if(!radiotchi_pwm_to_bytes(pulses, n, f, sizeof(f), &nbits)) return false;
+    if(nbits != 32u) return false; // exactly 4 bytes
+    if(radiotchi_crc8(f, 3, 0x07u, 0x00u) != f[3]) return false; // CRC-8/0x07 over bytes 0..2
+
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, "Acurite-606", sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    strncpy(ev->species_id, "weather-acurite-433", sizeof(ev->species_id) - 1);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    radiotchi_individual_fingerprint_bytes(f, 4, ev->individual, sizeof(ev->individual));
+    return true;
+}
+
 bool radiotchi_decode_from_pulses(
     uint32_t frequency_hz,
     Modulation modulation,
@@ -1079,8 +1103,9 @@ bool radiotchi_decode_from_pulses(
     if(ev == NULL || pulses == NULL || n == 0) return false;
     uint32_t band = band_bucket_mhz(frequency_hz);
 
-    // Specific, CRC-validated device decoders first (graduate to a named family), then the generic
-    // fixed-code / sensor families. Order = specificity; the first match wins.
+    // Order = specificity; the first match wins. Named device decoders (documented signatures)
+    // first, then the CRC-validated generic sensor, then the generic fixed-code / sensor families.
+    if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
 
     if(modulation == MOD_OOK) {

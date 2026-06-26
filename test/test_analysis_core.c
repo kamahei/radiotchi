@@ -783,6 +783,51 @@ static void test_crc_sensor(void) {
     CHECK(strcmp(evf.species_id, "sensor-fsk-5B-c31-868") == 0, "FSK CRC sensor named by len/crc/band");
 }
 
+static void test_named_sensors(void) {
+    printf("named sensors:\n");
+    int16_t buf[256];
+
+    // Acurite 606TX: a 32-bit OOK PWM frame whose last byte is CRC-8/0x07 over the first three.
+    uint8_t f[4] = {0x3A, 0x21, 0x84, 0};
+    f[3] = radiotchi_crc8(f, 3, 0x07u, 0x00u);
+    uint16_t n = build_pwm_bytes_frame(buf, 0, f, 32, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, f, 32, 350, 1050, 10500); // repeat (confidence)
+    RawCapture r;
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev = analyze_capture(&r, NULL, 1);
+    CHECK(ev.decode_tier == TIER_VALUES, "Acurite-606 frame reaches VALUES");
+    CHECK(strcmp(ev.species_id, "weather-acurite-433") == 0, "Acurite-606 names a weather species");
+    CHECK(strcmp(ev.protocol, "Acurite-606") == 0, "Acurite-606 protocol named");
+    CHECK(strncmp(ev.individual, "id-", 3) == 0, "Acurite sets a hashed per-device tag (A5)");
+
+    // A 32-bit OOK frame whose 4th byte is NOT the Acurite CRC must NOT be named Acurite — it stays
+    // in the generic ook-fixed family (no false model labeling).
+    uint8_t bad[4] = {0x3A, 0x21, 0x84, 0};
+    uint8_t crc = radiotchi_crc8(bad, 3, 0x07u, 0x00u);
+    bad[3] = (uint8_t)(crc ^ 0xFFu); // guaranteed != the Acurite CRC
+    n = build_pwm_bytes_frame(buf, 0, bad, 32, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, bad, 32, 350, 1050, 10500);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev2 = analyze_capture(&r, NULL, 1);
+    CHECK(strcmp(ev2.species_id, "ook-fixed-433") == 0, "non-Acurite 32-bit frame stays ook-fixed");
+
+    // Band guard: the same Acurite frame on a non-433 band is not named Acurite.
+    n = build_pwm_bytes_frame(buf, 0, f, 32, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, f, 32, 350, 1050, 10500);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 315000000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev3 = analyze_capture(&r, NULL, 1);
+    CHECK(strcmp(ev3.species_id, "weather-acurite-433") != 0, "Acurite gated to its 433 band");
+}
+
 static void test_species_branding(void) {
     printf("species branding:\n");
     char sp[RADIOTCHI_SPECIES_LEN];
@@ -1087,6 +1132,7 @@ int main(void) {
     test_pipeline_real_noise();
     test_fw_decode();
     test_crc_sensor();
+    test_named_sensors();
     test_species_branding();
     test_individual_fingerprint();
     test_values_tier();
