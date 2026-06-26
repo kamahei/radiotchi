@@ -179,8 +179,22 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   search) + a preamble/sync FSK sensor** (`sensor-2dd4-<n>B-<crc>-<band>`, the Fine Offset/Ecowitt/
   LaCrosse-class structure the whole-frame CRC sensor can't read) landed, fuzz-confirmed
   false-positive-free (220 checks). The pure decode toolkit is now crc8/checksum8/xor8/bits_get/
-  find_sync + pwm/ppm/manchester→bytes slicers; remaining fast-follow is confirming the named
-  protocols on real captures and GFSK/MSK reception.)*
+  find_sync + pwm/ppm/manchester→bytes slicers. An **offline `.sub` analyzer** (`tools/sub_analyze.c`)
+  + a **hardware-testing guide** (`docs/hardware-testing.md`) prep the on-device validation loop.
+  **2026-06-26: a high-effort multi-agent code review** of the decode work fixed the confirmed
+  over-/under-acceptance bugs: all-same guards added to `decode_acurite606` and
+  `radiotchi_manchester_decode` (degenerate all-0/all-1 frames no longer mint phantom species);
+  `decode_manch_sensor` now also runs for **2FSK** (FSK-Manchester / TPMS class); the 0x2DD4 sync
+  sensor is tied to the documented **CRC-8/0x31** only (no 3-poly multiplier); `decode_nexus_th`
+  gains a **temperature-plausibility** gate; honest comments on the glitch-filtered min estimator and
+  the ~3/256 multi-poly residual (Q3). Host-tested (225 checks). **Deferred re-grade follow-ups**
+  (real but lower-urgency, retroactive-consistency only): the `.sub` re-grade re-dispatches a row
+  only when its tier < VALUES, so a stored generic `ook-fixed`/`fsk-sensor` does not graduate to a
+  newly-added named decoder; the firmware brand remap is not re-applied on re-grade; and the
+  byte-diff learning collector (`capture_store.c`) still decodes only OOK-PWM/2FSK-NRZ, so PPM/
+  Manchester families show an empty diff. Remaining fast-follow: confirm named protocols on real
+  captures, address the re-grade graduation/brand-remap fragmentation, extend the diff collector,
+  and GFSK/MSK reception.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

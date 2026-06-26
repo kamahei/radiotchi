@@ -287,7 +287,7 @@ bool radiotchi_ook_pwm_decode(const int16_t* pulses, uint16_t n, uint32_t* code,
 //
 // Manchester encodes each bit as a mid-bit level transition, so the line carries runs of one
 // HALF-bit (the bit's two halves differ) or two half-bits (a half shared across a same-level bit
-// boundary). We estimate the half-bit unit as the glitch-filtered robust-min run, expand each run
+// boundary). We estimate the half-bit unit as the glitch-filtered minimum run, expand each run
 // back into round(dur/half-unit) half-bit samples, then recover bits by pairing samples at the
 // phase whose every pair is a transition (the data framing). Two candidate phases exist; the wrong
 // one hits a non-transition (a==b) at the first "10"/"01" bit adjacency, which is how we lock the
@@ -371,7 +371,9 @@ bool radiotchi_manchester_decode(
     const int16_t* pulses, uint16_t n, uint32_t* code, uint8_t* nbits) {
     if(pulses == NULL || n < WV_MAN_MIN_BITS * 2u) return false;
 
-    // Half-bit unit = the glitch-filtered robust-minimum run (gap-scale runs are far larger).
+    // Half-bit unit = the glitch-filtered MINIMUM run (gap-scale runs are far larger). Note: a
+    // spurious run just above the glitch floor can bias this low; the run-cap + repeat-confirm
+    // absorb mild cases, but a truly robust estimator is provisional (open-questions Q3).
     uint32_t half_unit = 0;
     for(uint16_t i = 0; i < n; i++) {
         uint32_t m = abs32(pulses[i]);
@@ -384,6 +386,12 @@ bool radiotchi_manchester_decode(
     uint8_t nbits0 = 0, nbits1 = 0;
     uint16_t next = 0, dummy = 0;
     if(!decode_manchester_frame(pulses, n, 0, half_unit, &code0, &nbits0, &next)) return false;
+
+    // Reject a degenerate all-0 / all-1 code: a periodic half-bit-rate tone (or noise that repeats
+    // that shape) phase-locks and confirms, but carries no device code — the same false-positive
+    // the FSK/byte slicers' all-same guards reject.
+    uint32_t allones = (nbits0 >= 32u) ? 0xFFFFFFFFu : ((1u << nbits0) - 1u);
+    if(code0 == 0u || code0 == allones) return false;
 
     // REQUIRE a confirming repeat with identical bits (the OOK/FSK noise guard, for Manchester).
     if(next + WV_MAN_MIN_BITS * 2u > n) return false; // no room for a confirming repeat
@@ -1213,8 +1221,10 @@ static bool decode_fsk_sensor(uint32_t band, const int16_t* pulses, uint16_t n, 
 
 // CRC-validate a sensor frame whose LAST byte is a check over the preceding bytes. Tries the
 // CRC-8 generators common to the rtl_433-class sensor catalog (0x07/0x31/0x2F, init 0). On a match
-// writes a short tag ("c07"/"c31"/"c2f") and returns true. CRC-only (no weak sum/xor) so a
-// non-sensor frame is very unlikely (~1/256 per poly) to be mislabeled. Pure.
+// writes a short tag ("c07"/"c31"/"c2f") and returns true. CRC-only (no weak sum/xor). NOTE: trying
+// 3 polynomials means a repeat-confirmed, non-all-same NON-sensor frame still has ~3/256 (~1.2%)
+// chance to pass coincidentally; the length floors in decode_crc_sensor keep most fixed-code remotes
+// out, and the residual is an accepted provisional tradeoff (open-questions Q3). Pure.
 static bool sensor_crc_valid(const uint8_t* frame, uint16_t n, char* out_tag, size_t tag_len) {
     if(frame == NULL || n < 4u) return false; // >= 3 data bytes + 1 check
     uint16_t dlen = (uint16_t)(n - 1u);
@@ -1346,8 +1356,10 @@ static bool decode_fsk_sync_sensor(uint32_t band, const int16_t* pulses, uint16_
         data[i] = (uint8_t)radiotchi_bits_get(f, flen, (uint16_t)(doff + (int32_t)(i * 8u)), 8);
     }
 
-    // The demod may carry trailing bytes past the CRC; try each candidate frame length.
-    char tag[8];
+    // The demod may carry trailing bytes past the CRC; try each candidate frame length. The 0x2DD4
+    // family (Fine Offset / Ecowitt / LaCrosse) uses CRC-8 generator 0x31, so we check ONLY that
+    // poly (not the 3-poly generic set) — tying the check to the documented protocol keeps the
+    // sync(16-bit) + CRC(8-bit) false-accept rate negligible despite the length loop.
     for(uint16_t len = 4; len <= dbytes; len++) {
         bool all_same = true;
         for(uint16_t i = 1; i < len; i++) {
@@ -1357,12 +1369,12 @@ static bool decode_fsk_sync_sensor(uint32_t band, const int16_t* pulses, uint16_
             }
         }
         if(all_same) continue;
-        if(!sensor_crc_valid(data, len, tag, sizeof(tag))) continue;
+        if(radiotchi_crc8(data, (uint16_t)(len - 1u), 0x31u, 0x00u) != data[len - 1u]) continue;
         ev->decode_tier = TIER_VALUES;
         strncpy(ev->protocol, "FSK-Sync", sizeof(ev->protocol) - 1);
         ev->protocol[sizeof(ev->protocol) - 1] = '\0';
         snprintf(
-            ev->species_id, sizeof(ev->species_id), "sensor-2dd4-%uB-%s-%u", (unsigned)len, tag,
+            ev->species_id, sizeof(ev->species_id), "sensor-2dd4-%uB-c31-%u", (unsigned)len,
             (unsigned)band);
         ev->species_id[sizeof(ev->species_id) - 1] = '\0';
         radiotchi_individual_fingerprint_bytes(data, len, ev->individual, sizeof(ev->individual));
@@ -1384,6 +1396,7 @@ static bool decode_acurite606(uint32_t band, const int16_t* pulses, uint16_t n, 
     uint16_t nbits = 0;
     if(!radiotchi_pwm_to_bytes(pulses, n, f, sizeof(f), &nbits)) return false;
     if(nbits != 32u) return false; // exactly 4 bytes
+    if(f[0] == f[1] && f[1] == f[2] && f[2] == f[3]) return false; // degenerate: CRC8(00..)==00
     if(radiotchi_crc8(f, 3, 0x07u, 0x00u) != f[3]) return false; // CRC-8/0x07 over bytes 0..2
 
     ev->decode_tier = TIER_VALUES;
@@ -1409,7 +1422,13 @@ static bool decode_nexus_th(uint32_t band, const int16_t* pulses, uint16_t n, Ca
     if(nbits < 36u) return false; // Nexus is a 36-bit frame
     uint16_t nbytes = (uint16_t)((nbits + 7u) / 8u);
     if(radiotchi_bits_get(f, nbytes, 24, 4) != 0xFu) return false; // the constant 0xF marker
-    if(radiotchi_bits_get(f, nbytes, 28, 8) > 100u) return false; // humidity in 0..100
+    // Humidity 0..100 (allow +1: the PPM terminating gap forces the last bit, the humidity LSB, to 1).
+    if(radiotchi_bits_get(f, nbytes, 28, 8) > 101u) return false;
+    // Temperature plausibility (a second structural gate so ordinary 433 PPM remotes don't pass the
+    // 4-bit marker by luck): 12-bit signed (bits 12..23), 0.1 C units, within roughly [-40, 70] C.
+    int32_t traw = (int32_t)radiotchi_bits_get(f, nbytes, 12, 12);
+    if(traw & 0x800) traw -= 0x1000; // sign-extend the 12-bit field
+    if(traw < -400 || traw > 700) return false;
 
     ev->decode_tier = TIER_VALUES;
     strncpy(ev->protocol, "Nexus-TH", sizeof(ev->protocol) - 1);
@@ -1436,6 +1455,9 @@ bool radiotchi_decode_from_pulses(
     if(modulation == MOD_OOK && decode_manch_sensor(band, pulses, n, ev)) return true;
     if(modulation == MOD_2FSK && decode_fsk_sync_sensor(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
+    // FSK-Manchester sensors (TPMS class): after the NRZ sync/CRC paths, so a genuine NRZ sensor
+    // isn't mis-sliced as Manchester first; the Manchester run-cap + CRC keep this safe.
+    if(modulation == MOD_2FSK && decode_manch_sensor(band, pulses, n, ev)) return true;
 
     if(modulation == MOD_OOK) {
         return decode_ook_fixed(band, pulses, n, ev);

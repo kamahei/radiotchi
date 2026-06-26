@@ -546,6 +546,14 @@ static void test_manchester_decode(void) {
     CHECK(
         !radiotchi_manchester_decode(buf, n, &code, &nbits),
         "disagreeing Manchester repeat frames are distrusted");
+
+    // A degenerate all-0 / all-1 waveform (a half-bit-rate tone) must NOT mint a code.
+    n = build_manchester_frame(buf, 0, 0x000u, 12, 250, 8000);
+    n = build_manchester_frame(buf, n, 0x000u, 12, 250, 8000);
+    CHECK(!radiotchi_manchester_decode(buf, n, &code, &nbits), "all-zero Manchester waveform rejected");
+    n = build_manchester_frame(buf, 0, 0xFFFu, 12, 250, 8000);
+    n = build_manchester_frame(buf, n, 0xFFFu, 12, 250, 8000);
+    CHECK(!radiotchi_manchester_decode(buf, n, &code, &nbits), "all-one Manchester waveform rejected");
 }
 
 // --- decoder toolkit (CRC / checksum / bit field / pwm-to-bytes) ------------
@@ -994,6 +1002,49 @@ static void test_named_sensors(void) {
         strcmp(evs.species_id, "sensor-2dd4-4B-c31-868") == 0,
         "sync FSK sensor named by sync/len/crc/band");
     CHECK(strncmp(evs.individual, "id-", 3) == 0, "sync FSK sensor sets a hashed tag (A5)");
+
+    // --- post-review false-positive / false-negative guards ---
+
+    // (a) An all-zero 32-bit OOK frame must NOT be minted as a phantom Acurite (CRC-8 of zeros == 0).
+    uint8_t zf[4] = {0, 0, 0, 0};
+    n = build_pwm_bytes_frame(buf, 0, zf, 32, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, zf, 32, 350, 1050, 10500);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent evz = analyze_capture(&r, NULL, 1);
+    CHECK(strcmp(evz.species_id, "weather-acurite-433") != 0, "all-zero OOK frame is not a phantom Acurite");
+
+    // (b) A Manchester-CRC sensor on 2FSK (the TPMS / FSK-Manchester class) now reaches the manch path.
+    uint8_t fd[5] = {0x4A, 0x33, 0x1C, 0x05, 0};
+    uint8_t fcrc = radiotchi_crc8(fd, 4, 0x07u, 0x00u);
+    for(int guard = 0; (fcrc & 1u) == 0u && guard < 256; guard++) {
+        fd[3] = (uint8_t)(fd[3] + 1u);
+        fcrc = radiotchi_crc8(fd, 4, 0x07u, 0x00u);
+    }
+    fd[4] = fcrc;
+    n = build_manchester_bytes_frame(buf, 0, fd, 40, 250, 8000);
+    n = build_manchester_bytes_frame(buf, n, fd, 40, 250, 8000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 868350000u;
+    r.modulation = MOD_2FSK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent evfm = analyze_capture(&r, NULL, 1);
+    CHECK(
+        evfm.decode_tier == TIER_VALUES && strcmp(evfm.species_id, "sensor-manch-5B-c07-868") == 0,
+        "FSK-Manchester sensor reaches the sensor-manch path");
+
+    // (c) A 433 PPM frame with the 0xF marker but an out-of-range temperature is NOT named Nexus.
+    uint8_t nbt[5] = {0x3A, 0x13, 0x20, 0xF3, 0x70}; // temp bits 12..23 = 0x320 = 80.0 C (> 70)
+    n = build_ppm_frame(buf, 0, nbt, 36, 500, 1000, 2000, 4000);
+    n = build_ppm_frame(buf, n, nbt, 36, 500, 1000, 2000, 4000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ent = analyze_capture(&r, NULL, 1);
+    CHECK(strcmp(ent.species_id, "th-nexus-433") != 0, "out-of-range-temp PPM frame is not Nexus");
 }
 
 static void test_species_branding(void) {
