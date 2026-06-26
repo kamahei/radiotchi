@@ -164,6 +164,35 @@ static uint16_t build_manchester_bytes_frame(
     return at;
 }
 
+// Asymmetric Manchester byte frame: real OOK Manchester has a mark/space duty-cycle skew (the slicer
+// threshold sits off the pulse midpoint), so mark half-bits (`hm`) differ from space half-bits (`hs`).
+// Same G.E. Thomas mapping as build_manchester_bytes_frame; used to pin the per-polarity half-bit
+// estimator — a single-unit slicer mis-rounds the longer polarity's full bit to 3 half-bits and the
+// phase pairing then collapses. Modeled on real Oregon timing (mark ~424us vs space ~556us half-bits).
+static uint16_t build_manchester_asym_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, uint16_t nbits, int16_t hm, int16_t hs,
+    int16_t gap) {
+    int run = 0;
+    int cur = -1;
+    for(uint16_t i = 0; i < nbits; i++) {
+        int bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        int halves[2] = {bit ? 0 : 1, bit ? 1 : 0};
+        for(int hbi = 0; hbi < 2; hbi++) {
+            int lvl = halves[hbi];
+            if(lvl == cur) {
+                run++;
+            } else {
+                if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)(cur ? hm : hs));
+                cur = lvl;
+                run = 1;
+            }
+        }
+    }
+    if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)(cur ? hm : hs));
+    out[at++] = (int16_t)(-gap);
+    return at;
+}
+
 // Append an OOK PWM frame for the first `nbits` of a byte array (MSB first): bit 0 = short mark +
 // long space, bit 1 = long mark + short space; the last bit's space is the sync `gap`. The
 // byte-oriented sibling of build_pwm_frame, for frames wider than 32 bits (sensor payloads).
@@ -1012,6 +1041,22 @@ static void test_named_sensors(void) {
         strcmp(evm.species_id, "sensor-manch-5B-c07-433") == 0,
         "Manchester CRC sensor named by len/crc/band");
     CHECK(strncmp(evm.individual, "id-", 3) == 0, "Manchester sensor sets a hashed tag (A5)");
+
+    // Real-data regression (found validating a real Oregon-THN132N capture): the SAME Manchester CRC
+    // frame, but with a real OOK mark/space duty-cycle skew (mark half-bit 300us vs space 460us). A
+    // single-half-unit slicer mis-rounds the wider space full-bit (920us) to 3 half-bits and the phase
+    // pairing collapses (the slicer recovered nothing on the real capture); the per-polarity estimator
+    // classifies each run against its own half-bit width and still reaches VALUES.
+    n = build_manchester_asym_frame(buf, 0, md, 40, 300, 460, 8000);
+    n = build_manchester_asym_frame(buf, n, md, 40, 300, 460, 8000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent eva = analyze_capture(&r, NULL, 1);
+    CHECK(
+        eva.decode_tier == TIER_VALUES && strcmp(eva.species_id, "sensor-manch-5B-c07-433") == 0,
+        "asymmetric (duty-skewed) Manchester CRC sensor still decodes");
 
     // Preamble + 0x2DD4 sync + 3 data bytes + CRC-8/0x31 (the Fine Offset/Ecowitt-class structure):
     // the whole-frame CRC sensor can't read it (preamble breaks a frame-wide CRC), but the

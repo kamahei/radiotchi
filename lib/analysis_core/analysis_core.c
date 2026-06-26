@@ -406,20 +406,48 @@ bool radiotchi_manchester_decode(
 // --- Manchester -> byte frame (for multi-byte Manchester sensors) -----------
 #define WV_MANB_SAMP_MAX 144u // half-bit samples buffered (<= 8 bytes * 8 bits * 2 + slack)
 
+// Robust half-bit width for ONE polarity (marks if want_mark, else spaces): the smallest run of that
+// sign with cluster support (>=3 runs within 25%). Real OOK Manchester has a mark/space duty-cycle
+// asymmetry (the slicer threshold is not at the pulse midpoint), so a single half-bit unit
+// mis-rounds the longer polarity's full-bit to 3 half-bits and corrupts the phase pairing; estimating
+// each polarity separately fixes that. A lone onset/glitch run has no cluster and can't drag the
+// estimate down. Falls back to the raw minimum. O(n^2), n<=256. Pure.
+static uint32_t man_half_for(const int16_t* pulses, uint16_t n, bool want_mark) {
+    uint32_t best = 0, raw = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        if((pulses[i] > 0) != want_mark) continue;
+        uint32_t mi = abs32(pulses[i]);
+        if(mi < WV_MAN_GLITCH_US) continue;
+        if(raw == 0u || mi < raw) raw = mi;
+        uint16_t support = 0;
+        for(uint16_t j = 0; j < n; j++) {
+            if((pulses[j] > 0) != want_mark) continue;
+            uint32_t mj = abs32(pulses[j]);
+            if(mj < WV_MAN_GLITCH_US) continue;
+            uint32_t d = (mj > mi) ? (mj - mi) : (mi - mj);
+            if(d * 4u <= mi) support++; // within 25% of mi
+        }
+        if(support >= 3u && (best == 0u || mi < best)) best = mi;
+    }
+    return best != 0u ? best : raw;
+}
+
 // Decode one Manchester frame at pulses[start] into MSB-first bytes (G.E. Thomas: low->high = 1).
-// Same half-bit reconstruction + phase search as decode_manchester_frame, but packs bytes (so a
-// frame wider than 32 bits round-trips). Returns the bit count via *nbits, the index past the frame
-// via *next; false if no plausible frame / no valid phase.
+// Each run is classified as 1 or 2 half-bits by its OWN polarity's half-bit width (mark_half /
+// space_half) — clean Manchester never has a run wider than 2 half-bits, and per-polarity widths
+// absorb the OOK duty-cycle asymmetry. A run that is neither ~1 nor ~2 of its polarity's half-bits is
+// not clean Manchester. Returns the bit count via *nbits, the index past the frame via *next.
 static bool decode_manchester_bytes_frame(
     const int16_t* pulses,
     uint16_t n,
     uint16_t start,
-    uint32_t half_unit,
+    uint32_t mark_half,
+    uint32_t space_half,
     uint8_t* out,
     uint16_t cap_bytes,
     uint16_t* nbits,
     uint16_t* next) {
-    uint32_t gap = half_unit * WV_MAN_GAP_MULT;
+    uint32_t gap = space_half * WV_MAN_GAP_MULT; // gaps are spaces; scale off the space half-bit
     if(gap < WV_MAN_GAP_FLOOR) gap = WV_MAN_GAP_FLOOR;
 
     uint8_t samp[WV_MANB_SAMP_MAX];
@@ -436,10 +464,16 @@ static bool decode_manchester_bytes_frame(
             }
             continue;
         }
-        uint32_t q = (mag + half_unit / 2u) / half_unit;
-        if(q < 1u) q = 1u;
-        if(q > WV_MAN_RUN_CAP) return false;
         uint8_t level = (pulses[i] > 0) ? 1u : 0u;
+        uint32_t half = level ? mark_half : space_half;
+        uint32_t q;
+        if(mag < (half * 3u) / 2u) {
+            q = 1u; // ~1 half-bit
+        } else if(mag < half * 3u) {
+            q = 2u; // ~2 half-bits (full bit) — tolerant of the asymmetry up to the gap scale
+        } else {
+            return false; // neither 1 nor 2 half-bits wide => not clean Manchester
+        }
         started = true;
         for(uint32_t r = 0; r < q && m < WV_MANB_SAMP_MAX; r++) samp[m++] = level;
     }
@@ -477,22 +511,19 @@ bool radiotchi_manchester_to_bytes(
     const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits) {
     if(pulses == NULL || out == NULL || cap == 0 || n < 16u) return false;
 
-    uint32_t half_unit = 0;
-    for(uint16_t i = 0; i < n; i++) {
-        uint32_t m = abs32(pulses[i]);
-        if(m < WV_MAN_GLITCH_US) continue;
-        if(half_unit == 0 || m < half_unit) half_unit = m;
-    }
-    if(half_unit == 0) return false;
+    uint32_t mark_half = man_half_for(pulses, n, true);
+    uint32_t space_half = man_half_for(pulses, n, false);
+    if(mark_half == 0u || space_half == 0u) return false;
 
     uint8_t f0[8];
     uint8_t f1[8];
     uint16_t fcap = cap < 8u ? cap : 8u;
     uint16_t nb0 = 0, nb1 = 0, next = 0, dummy = 0;
-    if(!decode_manchester_bytes_frame(pulses, n, 0, half_unit, f0, fcap, &nb0, &next)) return false;
+    if(!decode_manchester_bytes_frame(pulses, n, 0, mark_half, space_half, f0, fcap, &nb0, &next))
+        return false;
 
     if(next >= n) return false;
-    if(!decode_manchester_bytes_frame(pulses, n, next, half_unit, f1, fcap, &nb1, &dummy))
+    if(!decode_manchester_bytes_frame(pulses, n, next, mark_half, space_half, f1, fcap, &nb1, &dummy))
         return false;
     if(nb0 != nb1) return false;
     uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);

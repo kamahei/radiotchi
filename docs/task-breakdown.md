@@ -225,9 +225,18 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   SINGLE burst — added `fsk_slice_first` (sync+CRC is the guard, no repeat) while the no-CRC generic
   FSK path keeps its repeat; (6) the bit-period was the raw-minimum run, which an onset transient pulls
   below the true symbol and garbles the frame — now `fsk_estimate_bit_period` takes the smallest run
-  with cluster support. Host 230 checks. Remaining: a dedicated Fine Offset WH24 decoder (its longer
-  CRC+checksum frame and the crude converter's 1-bit onset alignment keep it at recognition), GFSK/MSK
-  reception, and the benign input-handler mutex discipline in `radiotchi_app.c` (single-core atomic).)*
+  with cluster support. **2026-06-26 (Manchester): bug (7) found validating a real Oregon-THN132N
+  capture** — the Manchester slicer used a single raw-minimum half-bit unit and `round(mag/half_unit)`,
+  but real OOK Manchester has a mark/space duty-cycle skew (measured ~424us vs ~556us half-bits) that
+  mis-rounds the wider polarity's full bit to 3 half-bits and collapses the phase pairing (the slicer
+  recovered NOTHING on the real capture). Fixed: estimate the half-bit width separately per polarity
+  (`man_half_for`, cluster-supported) and classify each run as exactly 1 or 2 half-bits against its own
+  width (clean Manchester is never wider). Oregon now slices to clean Manchester bits, though full
+  Oregon VALUES needs a dedicated decoder (v2.1 bit-doubling + nibble-sum checksum + LSB nibble order)
+  beyond the generic Manchester-CRC sensor. Host 231 checks. Remaining: a named Oregon decoder, a
+  dedicated Fine Offset WH24 decoder (its longer CRC+checksum frame and the crude converter's 1-bit
+  onset alignment keep it at recognition), GFSK/MSK reception, and the benign input-handler mutex
+  discipline in `radiotchi_app.c` (single-core atomic).)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
