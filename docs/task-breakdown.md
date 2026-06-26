@@ -175,7 +175,12 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   + a generic Manchester-CRC sensor** (`sensor-manch-<n>B-<crc>-<band>`, the Oregon/TPMS-class
   encoding) landed, fuzz-confirmed false-positive-free (212 checks). Fast-follow: more named models
   (Oregon/LaCrosse/TPMS) once real captures confirm signatures, a **bit-level sync-word search** for
-  preamble-framed protocols, and GFSK/MSK in the sweep.)*
+  preamble-framed protocols, and GFSK/MSK in the sweep. **`radiotchi_find_sync` (bit-level sync
+  search) + a preamble/sync FSK sensor** (`sensor-2dd4-<n>B-<crc>-<band>`, the Fine Offset/Ecowitt/
+  LaCrosse-class structure the whole-frame CRC sensor can't read) landed, fuzz-confirmed
+  false-positive-free (220 checks). The pure decode toolkit is now crc8/checksum8/xor8/bits_get/
+  find_sync + pwm/ppm/manchester→bytes slicers; remaining fast-follow is confirming the named
+  protocols on real captures and GFSK/MSK reception.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
