@@ -192,9 +192,22 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   only when its tier < VALUES, so a stored generic `ook-fixed`/`fsk-sensor` does not graduate to a
   newly-added named decoder; the firmware brand remap is not re-applied on re-grade; and the
   byte-diff learning collector (`capture_store.c`) still decodes only OOK-PWM/2FSK-NRZ, so PPM/
-  Manchester families show an empty diff. Remaining fast-follow: confirm named protocols on real
-  captures, address the re-grade graduation/brand-remap fragmentation, extend the diff collector,
-  and GFSK/MSK reception.)*
+  Manchester families show an empty diff. **A second review pass (full source, not just the diff)**
+  then fixed real bugs outside the decode work: the `.sub` reader truncated long RAW_Data lines
+  (re-grade/diff recovered ~36 of ~512 pulses — now a heap-`FuriString` line accumulator); the
+  re-grade rewrote the authoritative log with unchecked writes and removed-before-rename (a partial
+  temp write could replace the live log — now writes are checked and a failure aborts the swap); a
+  single-frequency capture plan could never clear the relative-margin gate (the noise floor included
+  the winning sample — now estimated from the non-winning ones); plus latent `uint16` loop wraps
+  (`repeating_frame`/`find_sync`), a `pulse_count` clamp, and a pet mood/hunger boundary. **The
+  deferred re-grade follow-ups are now RESOLVED:** `regrade_row` re-dispatches generic-VALUES rows
+  (`ook-fixed`/`fsk-sensor`) so they graduate to newly-added named decoders (but NOT firmware-decoded
+  rows, which the offline dispatch would downgrade), re-applies the brand remap to reconcile old
+  `Star Line`-style species, and rewrites on any field change (not just tier); the diff collector
+  `decode_sub_payload` is now SPECIES-DIRECTED (ppm/manchester/pwm/fsk per family) so PPM/Manchester
+  species populate the learning view. Remaining: confirm named protocols on real captures, GFSK/MSK
+  reception, and the benign input-handler mutex discipline in `radiotchi_app.c` (single-core atomic;
+  at most a one-frame visual glitch).)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

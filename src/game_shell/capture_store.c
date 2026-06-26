@@ -464,29 +464,55 @@ void capture_store_for_each_row(
 static uint16_t read_sub_pulses(Storage* storage, const char* sub_path, int16_t* pulses, uint16_t cap);
 
 static uint16_t decode_sub_payload(
-    Storage* storage, const char* sub_path, Modulation mod, uint8_t* out, uint16_t cap) {
+    Storage* storage,
+    const char* sub_path,
+    Modulation mod,
+    const char* species,
+    uint8_t* out,
+    uint16_t cap) {
     int16_t pulses[RADIOTCHI_PULSES_MAX];
     uint16_t pc = read_sub_pulses(storage, sub_path, pulses, RADIOTCHI_PULSES_MAX);
     if(pc == 0) return 0;
 
-    if(mod == MOD_2FSK) {
-        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+    // SPECIES-DIRECTED extraction: pick the slicer that decoded this species, so every capture of
+    // the same species yields the SAME byte layout for the diff to align. A fixed try-order would
+    // cross-match (a fixed-mark PPM frame "decodes" to all-zero under the PWM slicer).
+    uint8_t frame[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t nbits = 0;
+    uint16_t nbytes = 0;
+    if(species != NULL && strncmp(species, "th-nexus", 8) == 0) {
+        if(radiotchi_ppm_to_bytes(pulses, pc, frame, sizeof(frame), &nbits))
+            nbytes = (uint16_t)((nbits + 7u) / 8u);
+    } else if(species != NULL && strncmp(species, "sensor-manch", 12) == 0) {
+        if(radiotchi_manchester_to_bytes(pulses, pc, frame, sizeof(frame), &nbits))
+            nbytes = (uint16_t)((nbits + 7u) / 8u);
+    } else if(
+        species != NULL &&
+        (strncmp(species, "weather-acurite", 15) == 0 || strncmp(species, "sensor-ook", 10) == 0)) {
+        if(radiotchi_pwm_to_bytes(pulses, pc, frame, sizeof(frame), &nbits))
+            nbytes = (uint16_t)((nbits + 7u) / 8u);
+    } else if(mod == MOD_2FSK) {
+        // Covers fsk-sensor / sensor-fsk / sensor-2dd4 (the whole NRZ frame; the diff marks the
+        // static preamble/sync vs the varying payload).
         uint16_t flen = 0;
-        if(!radiotchi_fsk_sensor_decode(pulses, pc, frame, sizeof(frame), &flen)) return 0;
-        if(flen > cap) flen = cap;
-        memcpy(out, frame, flen);
-        return flen;
+        if(radiotchi_fsk_sensor_decode(pulses, pc, frame, sizeof(frame), &flen)) nbytes = flen;
+    } else {
+        // OOK fixed-code remote: pack the <=32-bit code MSB-first (stable across captures).
+        uint32_t code = 0;
+        uint8_t nb = 0;
+        if(!radiotchi_ook_pwm_decode(pulses, pc, &code, &nb)) return 0;
+        uint16_t n = (uint16_t)((nb + 7u) / 8u);
+        if(n > cap) n = cap;
+        for(uint16_t i = 0; i < n; i++) {
+            uint8_t shift = (uint8_t)((n - 1u - i) * 8u);
+            out[i] = (uint8_t)((code >> shift) & 0xFFu);
+        }
+        return n;
     }
 
-    uint32_t code = 0;
-    uint8_t nbits = 0;
-    if(!radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) return 0;
-    uint16_t nbytes = (uint16_t)((nbits + 7u) / 8u);
+    if(nbytes == 0) return 0;
     if(nbytes > cap) nbytes = cap;
-    for(uint16_t i = 0; i < nbytes; i++) { // pack the code MSB-first (stable across captures)
-        uint8_t shift = (uint8_t)((nbytes - 1u - i) * 8u);
-        out[i] = (uint8_t)((code >> shift) & 0xFFu);
-    }
+    memcpy(out, frame, nbytes);
     return nbytes;
 }
 
@@ -509,8 +535,8 @@ static void collect_payload_row(void* ctx, const char* const* fields, int nf) {
         if(nf < 16 || strcmp(fields[15], c->individual_filter) != 0) return;
     }
     Modulation mod = radiotchi_modulation_from_str(fields[3]);
-    uint16_t len =
-        decode_sub_payload(c->storage, sub_ref, mod, c->payloads[c->count], RADIOTCHI_DIFF_BYTES_MAX);
+    uint16_t len = decode_sub_payload(
+        c->storage, sub_ref, mod, fields[8], c->payloads[c->count], RADIOTCHI_DIFF_BYTES_MAX);
     if(len == 0) return; // undecodable row: skip (only comparable frames make the diff)
     c->lens[c->count] = len;
     c->count++;
@@ -598,7 +624,7 @@ static void try_values_from_sub(Storage* storage, const char* sub_path, CaptureE
 // the tier changed. Reconstructs only the fields the decoders need; an OOK row with a
 // `.sub` is re-demodulated for retroactive TIER_VALUES.
 static bool regrade_row(Storage* storage, const char* line, SpeciesIndex* idx, FuriString* out) {
-    char buf[256];
+    char buf[384]; // a full CSV row (subref + species + individual fit well under this)
     strncpy(buf, line, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -634,12 +660,36 @@ static bool regrade_row(Storage* storage, const char* line, SpeciesIndex* idx, F
     if(nf >= 16) strncpy(ev.individual, fields[15], sizeof(ev.individual) - 1); // preserve existing
 
     radiotchi_redecode(&ev); // signature pass: may raise up to PROTOCOL
-    // Retroactive VALUES: re-read the .sub timing for an OOK or 2FSK capture and really decode.
-    if(ev.decode_tier < TIER_VALUES &&
+
+    // Retroactive VALUES + graduation: re-read the .sub and run the full pulse dispatch when the row
+    // is below VALUES OR sits in a GENERIC pulse family (ook-fixed / fsk-sensor). Those are exactly
+    // the rows a newly-added named decoder (Acurite/Nexus/sensor-*) can improve. We deliberately do
+    // NOT re-dispatch firmware-decoded or already-named rows: the offline dispatch lacks the firmware
+    // Sub-GHz decoders, so re-running it on a "Star Line" capture would DOWNGRADE it to ook-fixed.
+    // radiotchi_decode_from_pulses is specific-first and monotonic, and try_values_from_sub only
+    // adopts a successful decode, so a graduated re-dispatch never lowers a row.
+    bool generic_values = (strncmp(ev.species_id, "ook-fixed", 9) == 0 ||
+                           strncmp(ev.species_id, "fsk-sensor", 10) == 0);
+    if((ev.decode_tier < TIER_VALUES || generic_values) &&
        (ev.modulation == MOD_OOK || ev.modulation == MOD_2FSK) && fields[14][0] != '\0') {
         try_values_from_sub(storage, fields[14], &ev);
     }
-    bool changed = (ev.decode_tier != original);
+
+    // Reconcile a pre-brand-remap firmware species (e.g. "Star Line" / "KeeLoq") to its branded
+    // family ("keyfob-starline-433" / "rolling-keeloq-433"). A non-brand species (ook-fixed, a named
+    // sensor, a fingerprint) contains no brand needle and is returned verbatim, so this is safe for
+    // every row and idempotent for already-branded ones.
+    char remapped[RADIOTCHI_SPECIES_LEN];
+    radiotchi_species_for_protocol(ev.species_id, ev.frequency_hz, remapped, sizeof(remapped));
+    if(remapped[0] != '\0') {
+        strncpy(ev.species_id, remapped, sizeof(ev.species_id) - 1);
+        ev.species_id[sizeof(ev.species_id) - 1] = '\0';
+    }
+
+    // Rewrite when ANY persisted decode field changed — not just the tier — so a same-tier
+    // graduation (ook-fixed-433 -> weather-acurite-433) and a brand remap actually persist.
+    bool changed = (ev.decode_tier != original) || (strcmp(ev.species_id, fields[8]) != 0) ||
+                   (nf >= 16 && strcmp(ev.individual, fields[15]) != 0);
     if(idx) species_index_bump(idx, ev.species_id, strtoull(fields[0], NULL, 10));
 
     if(changed) {
