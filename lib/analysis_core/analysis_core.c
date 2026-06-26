@@ -283,6 +283,118 @@ bool radiotchi_ook_pwm_decode(const int16_t* pulses, uint16_t n, uint32_t* code,
     return true;
 }
 
+// --- real demodulation: OOK Manchester fixed-code ---------------------------
+//
+// Manchester encodes each bit as a mid-bit level transition, so the line carries runs of one
+// HALF-bit (the bit's two halves differ) or two half-bits (a half shared across a same-level bit
+// boundary). We estimate the half-bit unit as the glitch-filtered robust-min run, expand each run
+// back into round(dur/half-unit) half-bit samples, then recover bits by pairing samples at the
+// phase whose every pair is a transition (the data framing). Two candidate phases exist; the wrong
+// one hits a non-transition (a==b) at the first "10"/"01" bit adjacency, which is how we lock the
+// right framing. As with the PWM/FSK decoders, only a frame confirmed by an immediately-following
+// identical repeat is trusted (real remotes retransmit; noise does not).
+#define WV_MAN_GLITCH_US 50u // ignore sub-50us spikes when estimating the half-bit unit
+#define WV_MAN_MIN_BITS  8u // a real fixed-code, not a stray blip
+#define WV_MAN_MAX_BITS  32u // fits a uint32 code
+#define WV_MAN_GAP_MULT  5u // a run >= this x the half-bit unit (or the floor) ends a frame
+#define WV_MAN_GAP_FLOOR 2000u // ...or an absolute several-ms inter-frame gap
+#define WV_MAN_RUN_CAP   3u // a sub-gap run longer than 3 half-bits is not clean Manchester
+#define WV_MAN_SAMP_MAX  72u // half-bit samples buffered per frame (>= 2*MAX_BITS + slack)
+
+// Decode the first Manchester frame at pulses[start]: rebuild its half-bit samples (to the gap),
+// then phase-search them into bits. Returns bits via *code/*nbits and the index past the frame via
+// *next. false if no plausible frame (too few bits, an anomalous run, or no valid phase).
+static bool decode_manchester_frame(
+    const int16_t* pulses,
+    uint16_t n,
+    uint16_t start,
+    uint32_t half_unit,
+    uint32_t* code,
+    uint8_t* nbits,
+    uint16_t* next) {
+    uint32_t gap = half_unit * WV_MAN_GAP_MULT;
+    if(gap < WV_MAN_GAP_FLOOR) gap = WV_MAN_GAP_FLOOR;
+
+    uint8_t samp[WV_MAN_SAMP_MAX];
+    uint16_t m = 0;
+    uint16_t i = start;
+    bool started = false;
+    for(; i < n; i++) {
+        uint32_t mag = abs32(pulses[i]);
+        if(mag < WV_MAN_GLITCH_US) continue; // drop a noise spike, stay in the frame
+        if(mag >= gap) { // inter-frame gap
+            if(started) {
+                i++; // consume the gap so the next frame starts past it
+                break;
+            }
+            continue; // leading silence before the frame: skip it
+        }
+        uint32_t q = (mag + half_unit / 2u) / half_unit; // round to whole half-bits
+        if(q < 1u) q = 1u;
+        if(q > WV_MAN_RUN_CAP) return false; // not a clean Manchester run
+        uint8_t level = (pulses[i] > 0) ? 1u : 0u;
+        started = true;
+        for(uint32_t r = 0; r < q && m < WV_MAN_SAMP_MAX; r++) samp[m++] = level;
+    }
+    if(m < WV_MAN_MIN_BITS * 2u) return false;
+
+    // Phase search: the correct framing pairs every (a,b) half-bit as a transition.
+    for(uint8_t phase = 0; phase < 2; phase++) {
+        uint32_t bits = 0;
+        uint8_t cnt = 0;
+        bool ok = true;
+        for(uint16_t k = phase; (uint16_t)(k + 1) < m; k += 2) {
+            uint8_t a = samp[k];
+            uint8_t b = samp[k + 1];
+            if(a == b) { // not a valid mid-bit transition for this phase
+                ok = false;
+                break;
+            }
+            if(cnt >= WV_MAN_MAX_BITS) {
+                ok = false;
+                break;
+            }
+            bits = (bits << 1) | (uint32_t)((a == 0u && b == 1u) ? 1u : 0u); // low->high = 1
+            cnt++;
+        }
+        if(ok && cnt >= WV_MAN_MIN_BITS) {
+            if(code) *code = bits;
+            if(nbits) *nbits = cnt;
+            if(next) *next = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool radiotchi_manchester_decode(
+    const int16_t* pulses, uint16_t n, uint32_t* code, uint8_t* nbits) {
+    if(pulses == NULL || n < WV_MAN_MIN_BITS * 2u) return false;
+
+    // Half-bit unit = the glitch-filtered robust-minimum run (gap-scale runs are far larger).
+    uint32_t half_unit = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        uint32_t m = abs32(pulses[i]);
+        if(m < WV_MAN_GLITCH_US) continue;
+        if(half_unit == 0 || m < half_unit) half_unit = m;
+    }
+    if(half_unit == 0) return false;
+
+    uint32_t code0 = 0, code1 = 0;
+    uint8_t nbits0 = 0, nbits1 = 0;
+    uint16_t next = 0, dummy = 0;
+    if(!decode_manchester_frame(pulses, n, 0, half_unit, &code0, &nbits0, &next)) return false;
+
+    // REQUIRE a confirming repeat with identical bits (the OOK/FSK noise guard, for Manchester).
+    if(next + WV_MAN_MIN_BITS * 2u > n) return false; // no room for a confirming repeat
+    if(!decode_manchester_frame(pulses, n, next, half_unit, &code1, &nbits1, &dummy)) return false;
+    if(code1 != code0 || nbits1 != nbits0) return false; // frames disagree => distrust
+
+    if(code) *code = code0;
+    if(nbits) *nbits = nbits0;
+    return true;
+}
+
 // --- real demodulation: 2FSK sensor frame (PCM/NRZ weather/telemetry/TPMS) -----
 //
 // The firmware's async-RAW slicer turns the 2FSK discriminator output into the SAME
@@ -638,6 +750,64 @@ DecodeTier radiotchi_classify(
     return TIER_MODULATION;
 }
 
+// Case-insensitive "does haystack contain needle" (needle is already lowercase, ASCII).
+static bool contains_ci(const char* hay, const char* needle) {
+    if(hay == NULL || needle == NULL) return false;
+    for(const char* h = hay; *h != '\0'; h++) {
+        const char* a = h;
+        const char* b = needle;
+        while(*a != '\0' && *b != '\0') {
+            char ca = *a;
+            if(ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if(ca != *b) break;
+            a++;
+            b++;
+        }
+        if(*b == '\0') return true; // matched the whole needle
+    }
+    return false;
+}
+
+void radiotchi_species_for_protocol(
+    const char* protocol, uint32_t frequency_hz, char* out, size_t out_len) {
+    if(out == NULL || out_len == 0) return;
+    out[0] = '\0';
+    if(protocol == NULL || protocol[0] == '\0') return;
+
+    // Brand families: a substring of the firmware protocol name -> a maker/system-named family.
+    // These are real manufacturer/brand names for gate, garage and car-alarm remotes; matching a
+    // brand graduates the species from a chip/cipher name to a maker-named family (A5: a make, not
+    // a per-device id). Keep ASCII, lowercase needles. Extensible — add a row to cover more makes;
+    // car-keyfob make discrimination beyond what the firmware names is deliberately left to real
+    // protocol decoders (it cannot be guessed from coarse RF features without mislabeling).
+    static const struct {
+        const char* needle;
+        const char* prefix;
+    } kBrands[] = {
+        {"starline", "keyfob-starline"}, {"star line", "keyfob-starline"},
+        {"scher", "keyfob-scherkhan"}, // Scher-Khan car alarm
+        {"came", "gate-came"},           {"nice", "gate-nice"},
+        {"hormann", "gate-hormann"},     {"holtek", "gate-holtek"},
+        {"chamberlain", "gate-chamberlain"}, {"security+", "gate-chamberlain"},
+        {"liftmaster", "gate-chamberlain"}, {"somfy", "gate-somfy"},
+        {"faac", "gate-faac"},           {"bft", "gate-bft"},
+        {"doorhan", "gate-doorhan"},     {"an-motors", "gate-anmotors"},
+        {"keeloq", "rolling-keeloq"},
+    };
+    unsigned band = (unsigned)band_bucket_mhz(frequency_hz);
+    for(size_t i = 0; i < sizeof(kBrands) / sizeof(kBrands[0]); i++) {
+        if(contains_ci(protocol, kBrands[i].needle)) {
+            snprintf(out, out_len, "%s-%u", kBrands[i].prefix, band);
+            out[out_len - 1] = '\0';
+            return;
+        }
+    }
+
+    // Unrecognized: keep the protocol name as the species (unchanged behaviour).
+    strncpy(out, protocol, out_len - 1);
+    out[out_len - 1] = '\0';
+}
+
 bool radiotchi_redecode(CaptureEvent* ev) {
     if(ev == NULL) return false;
     char protocol[RADIOTCHI_PROTOCOL_LEN];
@@ -736,15 +906,23 @@ CaptureEvent analyze_capture(
         ev.protocol[sizeof(ev.protocol) - 1] = '\0';
         strncpy(ev.individual, raw->fw_individual, sizeof(ev.individual) - 1);
         ev.individual[sizeof(ev.individual) - 1] = '\0';
-        // Species = the protocol family (privacy-safe; never the per-device serial).
-        strncpy(ev.species_id, raw->fw_protocol, sizeof(ev.species_id) - 1);
-        ev.species_id[sizeof(ev.species_id) - 1] = '\0';
+        // Species = a maker-named family when the protocol name carries a recognizable brand
+        // (e.g. "Star Line" -> "keyfob-starline-433"), else the protocol family name verbatim.
+        // Privacy-safe (A5): a make/brand label, never the per-device serial (that stays hashed
+        // in ev.individual).
+        radiotchi_species_for_protocol(
+            raw->fw_protocol, ev.frequency_hz, ev.species_id, sizeof(ev.species_id));
     } else if(raw->modulation == MOD_OOK && raw->pulse_count > 0) {
         uint32_t code = 0;
         uint8_t nbits = 0;
         bool got = false;
         if(radiotchi_ook_pwm_decode(raw->pulses, raw->pulse_count, &code, &nbits)) {
             // Clean PWM: we read the ACTUAL code -> a stable, privacy-safe per-device tag.
+            radiotchi_individual_fingerprint(code, nbits, ev.individual, sizeof(ev.individual));
+            got = true;
+        } else if(radiotchi_manchester_decode(raw->pulses, raw->pulse_count, &code, &nbits)) {
+            // Manchester fixed-code: bit-level decoded, so (unlike the coarse repeating-frame
+            // fingerprint below) it yields a trustworthy per-device tag.
             radiotchi_individual_fingerprint(code, nbits, ev.individual, sizeof(ev.individual));
             got = true;
         } else if(radiotchi_repeating_frame(raw->pulses, raw->pulse_count, NULL)) {

@@ -60,6 +60,19 @@ DecodeTier radiotchi_classify(
     char* species_out,
     size_t species_len);
 
+// Map a firmware-decoded protocol NAME to a branded, family-level species id (`<brand>-<band>`,
+// e.g. "keyfob-starline-433", "gate-came-433"). Many Sub-GHz remotes the firmware decodes carry a
+// recognizable manufacturer/system brand in their protocol name (gate, garage, and car-alarm
+// makers); graduating those to a maker-named family makes the dex read by make rather than by
+// chip/cipher name. Matching is case-insensitive substring, so it tolerates minor naming
+// differences across firmwares; an UNRECOGNIZED protocol keeps its own name as the species
+// (unchanged behaviour). Writes a NUL-terminated species into `out`. Pure.
+//
+// Privacy (A5): this is a FAMILY/brand label, NEVER the per-device serial — the decoded id lives
+// only in the one-way `individual` tag. The brand is a make, not an individual vehicle/device id.
+void radiotchi_species_for_protocol(
+    const char* protocol, uint32_t frequency_hz, char* out, size_t out_len);
+
 // Privacy-safe individual fingerprint of a decoded device code: a short ONE-WAY hash
 // ("id-XXXX") of (code, bit-width). Repeated captures of the SAME device share a stable
 // tag for local longitudinal learning (which device, how often, over time), but the raw
@@ -91,6 +104,21 @@ uint16_t radiotchi_parse_raw_data(const char* line, int16_t* out, uint16_t cap, 
 // tier); callers MUST NOT surface it as a trackable per-device identifier — the dex
 // species stays at the family/protocol granularity.
 bool radiotchi_ook_pwm_decode(const int16_t* pulses, uint16_t n, uint32_t* code, uint8_t* nbits);
+
+// Demodulate an OOK Manchester fixed-code frame (the class of remote that encodes each bit as a
+// mid-bit level transition rather than by mark width — many 315/433 MHz gate & keyfob remotes).
+// From the signed pulse train: estimate the HALF-bit unit as the glitch-filtered robust-minimum
+// run, expand each run to round(dur/half-unit) half-bit samples, then pair samples into bits by
+// the phase whose every pair is a transition (G.E. Thomas: low->high = 1, high->low = 0); frames
+// are split at the long inter-frame gap. As with the PWM/FSK decoders a frame is trusted only when
+// an immediately-following repeat decodes to the SAME bits (real remotes retransmit; noise does
+// not), so noise cannot fake a code. On success writes the code and bit length. This is the real
+// bit-level path for Manchester remotes (vs. the coarse, id-less waveform fingerprint of
+// radiotchi_repeating_frame). Pure.
+//
+// Note (privacy, A5): the decoded `code` only raises the tier and seeds a one-way per-device tag;
+// callers MUST NOT surface it as a trackable identifier — the dex species stays family-level.
+bool radiotchi_manchester_decode(const int16_t* pulses, uint16_t n, uint32_t* code, uint8_t* nbits);
 
 // Demodulate a structured 2FSK sensor frame (the weather/telemetry/TPMS PCM/NRZ class)
 // from a signed pulse train (+mark / -space µs, the firmware's async-RAW slicer output).

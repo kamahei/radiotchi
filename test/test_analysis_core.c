@@ -89,6 +89,36 @@ static uint16_t build_fsk_frame(
     return at;
 }
 
+// Append an OOK Manchester frame for `nbits` of `code` (MSB first), G.E. Thomas convention:
+// bit 1 = low half then high half, bit 0 = high half then low half (`h` = one HALF-bit µs).
+// Consecutive equal half-bits across a bit boundary coalesce into one 2x run (sign + for a high
+// half, - for a low half) — exactly as a real Manchester line looks after slicing — then a long
+// inter-frame gap. NOTE: a low (space) half-bit at a frame edge would merge into the low gap on a
+// real capture, so for clean repeat-confirmable frames build codes that start on bit 0 (high-first)
+// and end on bit 1 (high-last) — both edges stay marks and do not get absorbed by the gap.
+static uint16_t build_manchester_frame(
+    int16_t* out, uint16_t at, uint32_t code, uint8_t nbits, int16_t h, int16_t gap) {
+    int run = 0;
+    int cur = -1; // current half-bit level (1 high / 0 low), -1 = none yet
+    for(int i = (int)nbits - 1; i >= 0; i--) {
+        int bit = (int)((code >> i) & 1u);
+        int halves[2] = {bit ? 0 : 1, bit ? 1 : 0}; // 1 => low,high ; 0 => high,low
+        for(int hbi = 0; hbi < 2; hbi++) {
+            int lvl = halves[hbi];
+            if(lvl == cur) {
+                run++;
+            } else {
+                if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)h);
+                cur = lvl;
+                run = 1;
+            }
+        }
+    }
+    if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)h);
+    out[at++] = (int16_t)(-gap);
+    return at;
+}
+
 // --- entropy ---------------------------------------------------------------
 
 static void test_entropy(void) {
@@ -390,6 +420,57 @@ static void test_repeating_frame(void) {
     CHECK(!radiotchi_repeating_frame(FRAME, FL, &fp), "a single un-repeated frame is rejected");
 }
 
+// --- real OOK Manchester demodulation (TIER_VALUES) -------------------------
+
+static void test_manchester_decode(void) {
+    printf("manchester decode:\n");
+    int16_t buf[256];
+    uint32_t code = 0;
+    uint8_t nbits = 0;
+
+    // 0x4A5 starts on bit 0 (high-first) and ends on bit 1 (high-last), so neither frame edge is a
+    // low half-bit that the inter-frame gap would absorb — the two frames are byte-identical and
+    // confirm each other.
+    uint16_t n = build_manchester_frame(buf, 0, 0x4A5u, 12, 250, 8000);
+    n = build_manchester_frame(buf, n, 0x4A5u, 12, 250, 8000);
+    CHECK(radiotchi_manchester_decode(buf, n, &code, &nbits), "two Manchester frames decode");
+    CHECK(nbits == 12, "recovers the 12-bit code length");
+    CHECK(code == 0x4A5u, "recovers the exact code value (0x4A5)");
+
+    // Determinism: decoding the same train twice yields the same code (idempotent re-grade).
+    uint32_t code2 = 0;
+    uint8_t nbits2 = 0;
+    radiotchi_manchester_decode(buf, n, &code2, &nbits2);
+    CHECK(code == code2 && nbits == nbits2, "decode is deterministic");
+
+    // A different half-bit unit round-trips to the same code (the unit is estimated, not assumed).
+    n = build_manchester_frame(buf, 0, 0x4A5u, 12, 400, 12000);
+    n = build_manchester_frame(buf, n, 0x4A5u, 12, 400, 12000);
+    CHECK(
+        radiotchi_manchester_decode(buf, n, &code, &nbits) && code == 0x4A5u && nbits == 12,
+        "decodes with a different half-bit unit");
+
+    // A wider, 16-bit code (first bit 0, last bit 1) round-trips.
+    n = build_manchester_frame(buf, 0, 0x6C39u, 16, 250, 8000);
+    n = build_manchester_frame(buf, n, 0x6C39u, 16, 250, 8000);
+    CHECK(
+        radiotchi_manchester_decode(buf, n, &code, &nbits) && code == 0x6C39u && nbits == 16,
+        "16-bit Manchester code round-trips");
+
+    // A lone (un-repeated) frame is rejected — the noise guard (real remotes retransmit).
+    uint16_t one = build_manchester_frame(buf, 0, 0x4A5u, 12, 250, 8000);
+    CHECK(
+        !radiotchi_manchester_decode(buf, one, &code, &nbits),
+        "a single un-repeated Manchester frame is rejected");
+
+    // Two frames that DISAGREE => distrust.
+    n = build_manchester_frame(buf, 0, 0x4A5u, 12, 250, 8000);
+    n = build_manchester_frame(buf, n, 0x4B5u, 12, 250, 8000); // differs
+    CHECK(
+        !radiotchi_manchester_decode(buf, n, &code, &nbits),
+        "disagreeing Manchester repeat frames are distrusted");
+}
+
 static void test_parse_raw_data(void) {
     printf("parse raw_data:\n");
     int16_t buf[64];
@@ -471,6 +552,9 @@ static void test_real_noise_fixture(void) {
     CHECK(
         !radiotchi_ook_pwm_decode(pulses, n, &code, &nbits),
         "real ambient noise does NOT decode to a (false) VALUES code");
+    CHECK(
+        !radiotchi_manchester_decode(pulses, n, &code, &nbits),
+        "real ambient noise does NOT decode to a (false) Manchester code");
     CHECK(
         !radiotchi_repeating_frame(pulses, n, &rfp),
         "real ambient noise has no confirmed repeating frame (no false VALUES)");
@@ -589,6 +673,44 @@ static void test_fw_decode(void) {
     CHECK(strcmp(ev.individual, "id-1a2b") == 0, "uses the firmware (hashed) per-device id");
     CHECK(strcmp(ev.species_id, "Princeton") == 0, "species = protocol family (privacy-safe)");
     CHECK(ev.scores.nourishment == 1.0f, "VALUES => full nourishment");
+}
+
+static void test_species_branding(void) {
+    printf("species branding:\n");
+    char sp[RADIOTCHI_SPECIES_LEN];
+
+    // A branded car-alarm protocol -> a maker-named family species (with a band suffix).
+    radiotchi_species_for_protocol("Star Line", 433920000u, sp, sizeof(sp));
+    CHECK(strcmp(sp, "keyfob-starline-433") == 0, "Star Line -> keyfob-starline-433");
+
+    // Case-insensitive substring match + a different band.
+    radiotchi_species_for_protocol("CAME 12bit", 315000000u, sp, sizeof(sp));
+    CHECK(strcmp(sp, "gate-came-315") == 0, "CAME -> gate-came-315 (case/substring tolerant)");
+
+    radiotchi_species_for_protocol("KeeLoq", 433920000u, sp, sizeof(sp));
+    CHECK(strcmp(sp, "rolling-keeloq-433") == 0, "KeeLoq -> rolling-keeloq-433");
+
+    // An unbranded protocol keeps its own name (no regression vs the old verbatim behaviour).
+    radiotchi_species_for_protocol("Princeton", 433920000u, sp, sizeof(sp));
+    CHECK(strcmp(sp, "Princeton") == 0, "unbranded protocol keeps its name");
+
+    // Empty / null inputs are safe.
+    radiotchi_species_for_protocol("", 433920000u, sp, sizeof(sp));
+    CHECK(sp[0] == '\0', "empty protocol => empty species");
+
+    // End-to-end: analyze_capture applies the branding to species_id while the per-device id
+    // stays the hashed firmware tag (A5) and the protocol name is preserved.
+    RawCapture r;
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    strncpy(r.fw_protocol, "Star Line", sizeof(r.fw_protocol) - 1);
+    strncpy(r.fw_individual, "id-1234", sizeof(r.fw_individual) - 1);
+    CaptureEvent ev = analyze_capture(&r, NULL, 1);
+    CHECK(ev.decode_tier == TIER_VALUES, "firmware decode => VALUES");
+    CHECK(strcmp(ev.species_id, "keyfob-starline-433") == 0, "analyze_capture brands the species");
+    CHECK(strcmp(ev.individual, "id-1234") == 0, "the per-device id stays the hashed fw tag");
+    CHECK(strcmp(ev.protocol, "Star Line") == 0, "the protocol name is preserved");
 }
 
 // --- real 2FSK sensor demodulation (TIER_VALUES) ----------------------------
@@ -849,11 +971,13 @@ int main(void) {
     test_ook_decode();
     test_decoder_robustness();
     test_repeating_frame();
+    test_manchester_decode();
     test_parse_raw_data();
     test_fixture_sub();
     test_real_noise_fixture();
     test_pipeline_real_noise();
     test_fw_decode();
+    test_species_branding();
     test_individual_fingerprint();
     test_values_tier();
     test_fsk_decode();

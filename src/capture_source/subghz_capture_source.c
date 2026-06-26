@@ -83,6 +83,9 @@ SubGhzCaptureConfig subghz_capture_config_default(void) {
         .hop_dwell_ms = 10,
         .capture_window_ms = 500,
         .preset = FuriHalSubGhzPresetOok650Async,
+        // Try OOK first (most fixed-code remotes), then 2FSK so sensors/keyfobs are also received.
+        .presets = {FuriHalSubGhzPresetOok650Async, FuriHalSubGhzPreset2FSKDev476Async},
+        .preset_count = 2,
     };
     return c;
 }
@@ -373,7 +376,61 @@ static bool subghz_source_next_impl(void* impl, RawCapture* out) {
     if(rssi < src->config.rssi_threshold_dbm) return false;
     if((int)rssi - (int)src->noise_floor_dbm < src->config.detection_margin_db) return false;
 
-    return subghz_capture_source_capture(src, freq, out);
+    // Build the candidate demod-preset set (fall back to the single primary preset).
+    FuriHalSubGhzPreset candidates[RADIOTCHI_PRESETS_MAX];
+    uint8_t ncand = 0;
+    for(uint8_t i = 0; i < src->config.preset_count && ncand < RADIOTCHI_PRESETS_MAX; i++) {
+        candidates[ncand++] = src->config.presets[i];
+    }
+    if(ncand == 0) candidates[ncand++] = src->config.preset;
+
+    FuriHalSubGhzPreset saved = src->config.preset;
+
+    // Single modulation: capture once (no behavioural change vs. the original single-preset path).
+    if(ncand == 1) {
+        src->config.preset = candidates[0];
+        bool ok = subghz_capture_source_capture(src, freq, out);
+        src->config.preset = saved;
+        return ok;
+    }
+
+    // Multiple modulations: PROBE the locked frequency under each candidate to find the
+    // most-decoded preset (a firmware-protocol decode beats a louder-but-undecoded capture; ties
+    // break on RSSI), then do ONE FINAL capture in that preset. The final capture is what leaves
+    // the source's internal pulse buffer + last preset (which do_feed stages into the lossless
+    // `.sub`) consistent with *out, regardless of any intermediate probe that caught nothing. This
+    // is what lets an FSK signal be received even though the RSSI sweep listened in OOK.
+    // The probe scratch RawCapture (~0.9 KB) lives on the heap, not the 4 KB app stack.
+    RawCapture* cur = malloc(sizeof(RawCapture));
+    if(cur == NULL) { // out of memory: fall back to a single capture in the primary preset
+        src->config.preset = saved;
+        return subghz_capture_source_capture(src, freq, out);
+    }
+    bool have_best = false;
+    int best_rank = -1;
+    int16_t best_rssi = INT16_MIN;
+    FuriHalSubGhzPreset best_preset = candidates[0];
+    for(uint8_t i = 0; i < ncand; i++) {
+        src->config.preset = candidates[i];
+        if(!subghz_capture_source_capture(src, freq, cur)) continue;
+        int rank = (cur->fw_protocol[0] != '\0') ? 1 : 0;
+        if(!have_best || rank > best_rank || (rank == best_rank && cur->rssi_dbm > best_rssi)) {
+            have_best = true;
+            best_rank = rank;
+            best_rssi = cur->rssi_dbm;
+            best_preset = candidates[i];
+        }
+    }
+    free(cur);
+    if(!have_best) {
+        src->config.preset = saved;
+        return false;
+    }
+
+    src->config.preset = best_preset;
+    bool ok = subghz_capture_source_capture(src, freq, out);
+    src->config.preset = saved;
+    return ok;
 }
 
 CaptureSource subghz_capture_source_as_source(SubGhzCaptureSource* src) {

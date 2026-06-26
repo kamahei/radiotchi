@@ -603,6 +603,9 @@ static void try_values_from_sub(Storage* storage, const char* sub_path, CaptureE
     if(radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) {
         radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
         got = true;
+    } else if(radiotchi_manchester_decode(pulses, pc, &code, &nbits)) {
+        radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
+        got = true;
     } else if(radiotchi_repeating_frame(pulses, pc, NULL)) {
         got = true; // ev->individual stays as-is (empty for a fresh re-grade)
     }

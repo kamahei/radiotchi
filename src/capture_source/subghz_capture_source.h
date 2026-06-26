@@ -24,15 +24,25 @@ extern "C" {
 
 typedef struct SubGhzCaptureSource SubGhzCaptureSource;
 
+// Max demod presets tried per locked frequency (one capture window each).
+#define RADIOTCHI_PRESETS_MAX 4u
+
 typedef struct {
     int16_t rssi_threshold_dbm; // absolute floor: a signal must beat this to count
     int16_t detection_margin_db; // AND it must exceed the ambient noise floor by this
     uint32_t hop_dwell_ms; // RSSI settle time per hopped frequency
     uint32_t capture_window_ms; // how long to record the RAW burst once locked
-    FuriHalSubGhzPreset preset; // demod preset (OOK/2FSK/...) used while listening
+    FuriHalSubGhzPreset preset; // primary demod preset (used for the RSSI search sweep)
+    // Candidate demod presets tried on the LOCKED frequency, one capture each; the most-decoded
+    // is kept (a firmware-protocol decode beats a louder-but-undecoded capture). This is how an
+    // FSK signal is actually received even though the RSSI sweep listens in `preset`. When
+    // preset_count == 0, only `preset` is used (single-modulation, backward-compatible).
+    FuriHalSubGhzPreset presets[RADIOTCHI_PRESETS_MAX];
+    uint8_t preset_count;
 } SubGhzCaptureConfig;
 
-// Sensible defaults: scan-friendly threshold, fast hops, half-second capture, OOK.
+// Sensible defaults: scan-friendly threshold, fast hops, half-second capture, and an OOK + 2FSK
+// candidate set so both fixed-code remotes and FSK sensors/keyfobs are received.
 SubGhzCaptureConfig subghz_capture_config_default(void);
 
 // Allocate a live source over `plan` (copied in) with `config`. Returns NULL on

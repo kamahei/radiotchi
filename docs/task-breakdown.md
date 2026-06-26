@@ -144,7 +144,19 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   demodulates the PCM/NRZ-with-repeat sensor subclass to **VALUES**, `analyze_capture` uses it
   for live 2FSK, and the re-grade now re-reads the `.sub` for **OOK *or* 2FSK** rows (shared
   `read_sub_pulses`). Host-tested + committed synthetic FSK fixture (`AA C5 3D`); on-device
-  validation pending. Remaining: a real-capture FSK regression fixture + more framings/families.)*
+  validation pending. **2026-06-26: three breadth additions landed** (D36) — a real **OOK
+  Manchester** value decoder (`radiotchi_manchester_decode`, half-bit transition timing + phase
+  search + repeat-confirm) that reaches **VALUES with a genuine per-device tag** for the
+  bit-decodable Manchester subclass (closing D28's id gap), slotted into `analyze_capture` and the
+  `.sub` re-grade between the PWM and repeating-frame paths; a **multi-modulation capture sweep**
+  (`SubGhzCaptureConfig` candidate presets, default OOK650 + 2FSKDev476) so **FSK** signals are
+  actually received (the RSSI sweep locks the frequency, then the source captures it under each
+  preset and keeps the most-decoded); and **maker-named family species**
+  (`radiotchi_species_for_protocol` maps brand-named firmware protocols → `<brand-family>-<band>`,
+  e.g. `gate-came-433`, `keyfob-starline-433`; per-device serial stays in the hashed tag, A5).
+  Host-tested (167 checks) + FAP builds clean; on-device FSK-reception + Manchester validation
+  pending. Remaining: a real-capture FSK/Manchester regression fixture + more framings/families,
+  and preamble/length-aware Manchester framing.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
