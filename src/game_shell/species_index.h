@@ -18,7 +18,7 @@ extern "C" {
 
 typedef struct Storage Storage; // opaque; borrowed from CaptureStore
 
-#define SPECIES_INDEX_MAX 128u // RAM cap; real distinct-species count is small
+#define SPECIES_INDEX_MAX 256u // RAM cap; raised from 128 as device decoders fan out the dex
 
 typedef struct {
     char species_id[RADIOTCHI_SPECIES_LEN];

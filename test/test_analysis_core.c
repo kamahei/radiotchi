@@ -119,6 +119,22 @@ static uint16_t build_manchester_frame(
     return at;
 }
 
+// Append an OOK PWM frame for the first `nbits` of a byte array (MSB first): bit 0 = short mark +
+// long space, bit 1 = long mark + short space; the last bit's space is the sync `gap`. The
+// byte-oriented sibling of build_pwm_frame, for frames wider than 32 bits (sensor payloads).
+static uint16_t build_pwm_bytes_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, uint16_t nbits, int16_t s, int16_t l,
+    int16_t gap) {
+    for(uint16_t i = 0; i < nbits; i++) {
+        int bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        int16_t mark = bit ? l : s;
+        int16_t space = (i == (uint16_t)(nbits - 1)) ? gap : (bit ? s : l);
+        out[at++] = mark;
+        out[at++] = (int16_t)(-space);
+    }
+    return at;
+}
+
 // --- entropy ---------------------------------------------------------------
 
 static void test_entropy(void) {
@@ -471,6 +487,46 @@ static void test_manchester_decode(void) {
         "disagreeing Manchester repeat frames are distrusted");
 }
 
+// --- decoder toolkit (CRC / checksum / bit field / pwm-to-bytes) ------------
+
+static void test_toolkit(void) {
+    printf("toolkit:\n");
+
+    // CRC-8 (poly 0x07, init 0x00) over "123456789" is the well-known check value 0xF4.
+    const uint8_t check[9] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    CHECK(radiotchi_crc8(check, 9, 0x07u, 0x00u) == 0xF4u, "CRC-8/0x07 check value is 0xF4");
+    // Appending the CRC byte makes the CRC over the whole frame zero (self-check property).
+    uint8_t framed[10];
+    memcpy(framed, check, 9);
+    framed[9] = radiotchi_crc8(check, 9, 0x07u, 0x00u);
+    CHECK(radiotchi_crc8(framed, 10, 0x07u, 0x00u) == 0x00u, "CRC over data+crc is 0");
+
+    const uint8_t s3[3] = {0x01, 0x02, 0x03};
+    CHECK(radiotchi_checksum8(s3, 3) == 0x06u, "checksum8 sums bytes");
+    const uint8_t x2[2] = {0xFF, 0x0F};
+    CHECK(radiotchi_xor8(x2, 2) == 0xF0u, "xor8 xors bytes");
+
+    const uint8_t bb[2] = {0xAB, 0xCD}; // 1010 1011 1100 1101
+    CHECK(radiotchi_bits_get(bb, 2, 0, 4) == 0xAu, "bits_get nibble 0 = 0xA");
+    CHECK(radiotchi_bits_get(bb, 2, 4, 8) == 0xBCu, "bits_get cross-byte field = 0xBC");
+    CHECK(radiotchi_bits_get(bb, 2, 8, 8) == 0xCDu, "bits_get byte 1 = 0xCD");
+    CHECK(radiotchi_bits_get(bb, 2, 12, 8) == 0xD0u, "bits past the buffer read as 0");
+
+    // pwm_to_bytes: a 16-bit OOK PWM frame -> {0xAB, 0xCD}, repeat-confirmed.
+    int16_t buf[256];
+    uint16_t n = build_pwm_frame(buf, 0, 0xABCDu, 16, 350, 1050, 10500);
+    n = build_pwm_frame(buf, n, 0xABCDu, 16, 350, 1050, 10500);
+    uint8_t bytes[8];
+    uint16_t nbits = 0;
+    CHECK(radiotchi_pwm_to_bytes(buf, n, bytes, sizeof(bytes), &nbits), "pwm_to_bytes decodes");
+    CHECK(nbits == 16 && bytes[0] == 0xABu && bytes[1] == 0xCDu, "pwm_to_bytes recovers AB CD");
+    // A lone (un-repeated) frame is rejected (noise guard).
+    uint16_t one = build_pwm_frame(buf, 0, 0xABCDu, 16, 350, 1050, 10500);
+    CHECK(
+        !radiotchi_pwm_to_bytes(buf, one, bytes, sizeof(bytes), &nbits),
+        "pwm_to_bytes rejects a lone frame");
+}
+
 static void test_parse_raw_data(void) {
     printf("parse raw_data:\n");
     int16_t buf[64];
@@ -673,6 +729,58 @@ static void test_fw_decode(void) {
     CHECK(strcmp(ev.individual, "id-1a2b") == 0, "uses the firmware (hashed) per-device id");
     CHECK(strcmp(ev.species_id, "Princeton") == 0, "species = protocol family (privacy-safe)");
     CHECK(ev.scores.nourishment == 1.0f, "VALUES => full nourishment");
+}
+
+static void test_crc_sensor(void) {
+    printf("crc sensor:\n");
+    int16_t buf[256];
+
+    // OOK: a 5-byte frame whose last byte is CRC-8/0x07 over the first 4 -> a CRC-validated sensor
+    // species (named by modulation/length/crc/band), tried BEFORE the generic ook-fixed family.
+    uint8_t f[5] = {0x12, 0x34, 0x56, 0x78, 0};
+    f[4] = radiotchi_crc8(f, 4, 0x07u, 0x00u);
+    uint16_t n = build_pwm_bytes_frame(buf, 0, f, 40, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, f, 40, 350, 1050, 10500); // repeat (confidence)
+    RawCapture r;
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev = analyze_capture(&r, NULL, 1);
+    CHECK(ev.decode_tier == TIER_VALUES, "OOK CRC sensor reaches VALUES");
+    CHECK(strcmp(ev.species_id, "sensor-ook-5B-c07-433") == 0, "OOK CRC sensor named by len/crc/band");
+    CHECK(strncmp(ev.individual, "id-", 3) == 0, "CRC sensor sets a per-device tag (hashed, A5)");
+
+    // A 40-bit OOK frame with NO valid CRC must NOT be mislabeled a sensor — it stays ook-fixed.
+    uint8_t bad[5] = {0x12, 0x34, 0x56, 0x78, 0};
+    uint8_t c07 = radiotchi_crc8(bad, 4, 0x07u, 0), c31 = radiotchi_crc8(bad, 4, 0x31u, 0),
+            c2f = radiotchi_crc8(bad, 4, 0x2Fu, 0);
+    uint8_t v = 1;
+    while(v == c07 || v == c31 || v == c2f) v++;
+    bad[4] = v; // guaranteed to match none of the tried CRCs
+    n = build_pwm_bytes_frame(buf, 0, bad, 40, 350, 1050, 10500);
+    n = build_pwm_bytes_frame(buf, n, bad, 40, 350, 1050, 10500);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent ev2 = analyze_capture(&r, NULL, 1);
+    CHECK(ev2.decode_tier == TIER_VALUES, "non-CRC 40-bit OOK frame still reaches VALUES");
+    CHECK(strcmp(ev2.species_id, "ook-fixed-433") == 0, "non-CRC frame stays ook-fixed (no false sensor)");
+
+    // FSK: a 5-byte frame whose last byte is CRC-8/0x31 over the first 4 -> a CRC-validated species.
+    uint8_t g[5] = {0xA1, 0xB2, 0xC3, 0xD4, 0};
+    g[4] = radiotchi_crc8(g, 4, 0x31u, 0x00u);
+    n = build_fsk_frame(buf, 0, g, 40, 100, 8000);
+    n = build_fsk_frame(buf, n, g, 40, 100, 8000);
+    RawCapture rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.frequency_hz = 868350000u;
+    rf.modulation = MOD_2FSK;
+    attach_pulses(&rf, buf, n);
+    CaptureEvent evf = analyze_capture(&rf, NULL, 1);
+    CHECK(evf.decode_tier == TIER_VALUES, "FSK CRC sensor reaches VALUES");
+    CHECK(strcmp(evf.species_id, "sensor-fsk-5B-c31-868") == 0, "FSK CRC sensor named by len/crc/band");
 }
 
 static void test_species_branding(void) {
@@ -972,11 +1080,13 @@ int main(void) {
     test_decoder_robustness();
     test_repeating_frame();
     test_manchester_decode();
+    test_toolkit();
     test_parse_raw_data();
     test_fixture_sub();
     test_real_noise_fixture();
     test_pipeline_real_noise();
     test_fw_decode();
+    test_crc_sensor();
     test_species_branding();
     test_individual_fingerprint();
     test_values_tier();

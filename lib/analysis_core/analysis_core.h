@@ -179,6 +179,48 @@ uint8_t radiotchi_select_by_individual(
 // real per-device id for these encodings needs the firmware's protocol decoders (TB.1). Pure.
 bool radiotchi_repeating_frame(const int16_t* pulses, uint16_t n, uint16_t* fp);
 
+// --- decoder toolkit (pure building blocks for device-protocol decoders) ------
+//
+// Small, reusable primitives so each new device decoder is a few lines: slice a frame's bytes,
+// validate a checksum, pull a bit field. All pure and host-tested. These are what make adding
+// many sensor/remote decoders cheap (the dex grows with each new recognized family).
+
+// MSB-first CRC-8 over `data[0..len)` with generator `poly` and initial value `init` (no final
+// XOR / no reflection — the common rtl_433-class sensor CRC form). Pure.
+uint8_t radiotchi_crc8(const uint8_t* data, uint16_t len, uint8_t poly, uint8_t init);
+
+// 8-bit additive checksum (sum of bytes mod 256) over `data[0..len)`. Pure.
+uint8_t radiotchi_checksum8(const uint8_t* data, uint16_t len);
+
+// 8-bit XOR of `data[0..len)`. Pure.
+uint8_t radiotchi_xor8(const uint8_t* data, uint16_t len);
+
+// Extract a big-endian bit field of `nbits` (1..32) starting at bit offset `bit_off` from a
+// MSB-first byte buffer (bit 0 = MSB of byte 0). Bits beyond the buffer read as 0 — the caller
+// is expected to have length-checked. Pure.
+uint32_t radiotchi_bits_get(const uint8_t* bytes, uint16_t nbytes, uint16_t bit_off, uint8_t nbits);
+
+// Demodulate an OOK PWM byte frame (bit set by MARK width: long mark = 1, short = 0; the Acurite/
+// generic OOK-sensor coding), packing MSB-first into `out` (capacity `cap` bytes). Frames split at
+// the long sync gap; a frame is trusted only when an immediately-following repeat packs the SAME
+// bytes (the noise guard). Returns the bit count via *nbits and true on a confirmed frame. Pure.
+bool radiotchi_pwm_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits);
+
+// Run the pulse-based VALUES decoders in priority order on a captured pulse train, filling
+// ev->decode_tier (TIER_VALUES), protocol, species_id and individual on the first that succeeds.
+// Specific device decoders (CRC-validated sensors) are tried BEFORE the generic fixed-code /
+// sensor families, so a recognized device graduates to its named species (more dex breadth).
+// Returns true if any decoder matched (ev updated); false otherwise (ev untouched). Shared by
+// live capture (`analyze_capture`) and the `.sub` re-grade so both reach identical results — adding
+// a decoder here lights it up on new captures AND retroactively on stored ones. Pure.
+bool radiotchi_decode_from_pulses(
+    uint32_t frequency_hz,
+    Modulation modulation,
+    const int16_t* pulses,
+    uint16_t n,
+    CaptureEvent* ev);
+
 // Re-run the classifier on a stored event using its retained features, RAISING its
 // DecodeTier (never lowering it), protocol, species, and Nourishment if a decoder now
 // recognizes it. The other four axes are untouched. This is the re-grade entry point:

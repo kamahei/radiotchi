@@ -34,6 +34,10 @@ extern "C" {
 // packet is small; the lossless original stays the `.sub`).
 #define RADIOTCHI_FSK_FRAME_MAX 16u
 
+// Max bytes of a generic device-sensor byte frame the toolkit slicers pack (OOK PWM / CRC-sensor
+// path). Real sensor packets are small; bounding this keeps the decode-path stack tiny (FAP 4 KB).
+#define RADIOTCHI_SENSOR_FRAME_MAX 32u
+
 // Max byte positions classified by the diff-learning view (one `id-XXXX`'s frames
 // aligned column-by-column). Frames of these families are small; 32 is ample.
 #define RADIOTCHI_DIFF_BYTES_MAX 32u

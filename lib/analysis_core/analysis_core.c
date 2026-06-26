@@ -654,6 +654,119 @@ bool radiotchi_repeating_frame(const int16_t* pulses, uint16_t n, uint16_t* fp) 
     return false;
 }
 
+// --- decoder toolkit (reusable building blocks for device-protocol decoders) -----
+
+uint8_t radiotchi_crc8(const uint8_t* data, uint16_t len, uint8_t poly, uint8_t init) {
+    uint8_t crc = init;
+    if(data == NULL) return crc;
+    for(uint16_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for(uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x80u) ? (uint8_t)((crc << 1) ^ poly) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+uint8_t radiotchi_checksum8(const uint8_t* data, uint16_t len) {
+    uint8_t sum = 0;
+    if(data == NULL) return 0;
+    for(uint16_t i = 0; i < len; i++) sum = (uint8_t)(sum + data[i]);
+    return sum;
+}
+
+uint8_t radiotchi_xor8(const uint8_t* data, uint16_t len) {
+    uint8_t x = 0;
+    if(data == NULL) return 0;
+    for(uint16_t i = 0; i < len; i++) x ^= data[i];
+    return x;
+}
+
+uint32_t radiotchi_bits_get(
+    const uint8_t* bytes, uint16_t nbytes, uint16_t bit_off, uint8_t nbits) {
+    uint32_t v = 0;
+    if(bytes == NULL || nbits == 0 || nbits > 32) return 0;
+    for(uint8_t k = 0; k < nbits; k++) {
+        uint16_t pos = (uint16_t)(bit_off + k);
+        uint8_t bit = 0;
+        if((pos >> 3) < nbytes) bit = (uint8_t)((bytes[pos >> 3] >> (7u - (pos & 7u))) & 1u);
+        v = (v << 1) | bit;
+    }
+    return v;
+}
+
+// Decode one OOK PWM (mark-coded) frame at pulses[start] into MSB-first bytes (long mark = 1, short
+// = 0; split at 1.5x the short unit, robust even for a 1-terminated last bit since the bit is the
+// MARK not the gap space). Ends at a space >= gap. Returns the bit count via *nbits, the index past
+// the frame via *next; false if too short or overrun. Mirrors decode_pwm_frame but packs bytes.
+static bool decode_pwm_bytes_frame(
+    const int16_t* pulses,
+    uint16_t n,
+    uint16_t start,
+    uint32_t short_unit,
+    uint8_t* out,
+    uint16_t cap_bytes,
+    uint16_t* nbits,
+    uint16_t* next) {
+    uint32_t gap = short_unit * WV_PWM_GAP_MULT;
+    if(gap < WV_PWM_GAP_FLOOR) gap = WV_PWM_GAP_FLOOR;
+    uint32_t mark_thresh = short_unit + short_unit / 2u;
+    uint16_t cap_bits = (uint16_t)(cap_bytes * 8u);
+    for(uint16_t b = 0; b < cap_bytes; b++) out[b] = 0;
+
+    uint16_t count = 0;
+    uint16_t i = start;
+    for(; i + 1 < n; i += 2) {
+        uint32_t mark = abs32(pulses[i]);
+        uint32_t space = abs32(pulses[i + 1]);
+        if(count >= cap_bits) return false; // overran the byte buffer
+        if(mark > mark_thresh) out[count >> 3] |= (uint8_t)(0x80u >> (count & 7u));
+        count++;
+        if(space >= gap) { // sync gap ends the frame
+            i += 2;
+            break;
+        }
+    }
+    if(count < 8u) return false; // need at least a byte
+    if(nbits) *nbits = count;
+    if(next) *next = i;
+    return true;
+}
+
+bool radiotchi_pwm_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits) {
+    if(pulses == NULL || out == NULL || cap == 0 || n < 16u) return false;
+
+    uint16_t start = 0;
+    if(pulses[0] < 0) start = 1; // begin on a mark
+    uint32_t short_unit = 0;
+    for(uint16_t i = start; i < n; i++) {
+        uint32_t m = abs32(pulses[i]);
+        if(m < WV_PWM_GLITCH_US) continue;
+        if(short_unit == 0 || m < short_unit) short_unit = m;
+    }
+    if(short_unit == 0) return false;
+
+    uint8_t f0[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint8_t f1[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t fcap = cap < RADIOTCHI_SENSOR_FRAME_MAX ? cap : RADIOTCHI_SENSOR_FRAME_MAX;
+    uint16_t nb0 = 0, nb1 = 0, next = 0, dummy = 0;
+    if(!decode_pwm_bytes_frame(pulses, n, start, short_unit, f0, fcap, &nb0, &next)) return false;
+
+    // REQUIRE a confirming repeat with identical bytes (the noise guard, as the other decoders).
+    if(next >= n) return false;
+    if(!decode_pwm_bytes_frame(pulses, n, next, short_unit, f1, fcap, &nb1, &dummy)) return false;
+    if(nb0 != nb1) return false;
+    uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);
+    if(nbytes > fcap) nbytes = fcap;
+    for(uint16_t i = 0; i < nbytes; i++) {
+        if(f0[i] != f1[i]) return false;
+    }
+    for(uint16_t i = 0; i < nbytes; i++) out[i] = f0[i];
+    if(nbits) *nbits = nb0;
+    return true;
+}
+
 // --- protocol classifier (provisional, signature-based) --------------------
 //
 // The Nourishment ladder needs *something* to raise the tier above RAW. We can not
@@ -848,6 +961,136 @@ Scores score_capture(const CaptureEvent* ev, const RarityView* dex_rarity) {
     return s;
 }
 
+// --- unified pulse-based decode dispatch -----------------------------------
+//
+// One ordered place that runs every pulse-based VALUES decoder, shared by live capture and the
+// `.sub` re-grade. Specific CRC-validated device decoders run BEFORE the generic fixed-code /
+// sensor families, so a recognized sensor/remote graduates to its named species instead of the
+// generic bucket. Adding a decoder = add it here (and it lights up on new + stored captures).
+
+// Generic OOK fixed-code family (the EV1527/PT2262 + Manchester + repeating-frame ladder).
+// Sets ev to TIER_VALUES / "ook-fixed-<band>" and a per-device tag (none for the coarse
+// repeating-frame path). Returns true on a confirmed decode.
+static bool decode_ook_fixed(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    uint32_t code = 0;
+    uint8_t nbits = 0;
+    bool got = false;
+    if(radiotchi_ook_pwm_decode(pulses, n, &code, &nbits)) {
+        radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
+        got = true;
+    } else if(radiotchi_manchester_decode(pulses, n, &code, &nbits)) {
+        radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
+        got = true;
+    } else if(radiotchi_repeating_frame(pulses, n, NULL)) {
+        got = true; // coarse waveform fingerprint: no trustworthy per-device tag (D28)
+    }
+    if(!got) return false;
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, WV_PROTO_OOK_FIXED, sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    snprintf(ev->species_id, sizeof(ev->species_id), "ook-fixed-%u", (unsigned)band);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    return true;
+}
+
+// Generic structured-2FSK sensor family (PCM/NRZ-with-repeat). Sets ev to TIER_VALUES /
+// "fsk-sensor-<band>" + a one-way per-device tag. Returns true on a confirmed frame.
+static bool decode_fsk_sensor(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen = 0;
+    if(!radiotchi_fsk_sensor_decode(pulses, n, frame, sizeof(frame), &flen)) return false;
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, WV_PROTO_FSK_SENSOR, sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    snprintf(ev->species_id, sizeof(ev->species_id), "fsk-sensor-%u", (unsigned)band);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    radiotchi_individual_fingerprint_bytes(frame, flen, ev->individual, sizeof(ev->individual));
+    return true;
+}
+
+// CRC-validate a sensor frame whose LAST byte is a check over the preceding bytes. Tries the
+// CRC-8 generators common to the rtl_433-class sensor catalog (0x07/0x31/0x2F, init 0). On a match
+// writes a short tag ("c07"/"c31"/"c2f") and returns true. CRC-only (no weak sum/xor) so a
+// non-sensor frame is very unlikely (~1/256 per poly) to be mislabeled. Pure.
+static bool sensor_crc_valid(const uint8_t* frame, uint16_t n, char* out_tag, size_t tag_len) {
+    if(frame == NULL || n < 4u) return false; // >= 3 data bytes + 1 check
+    uint16_t dlen = (uint16_t)(n - 1u);
+    uint8_t chk = frame[n - 1u];
+    static const uint8_t polys[] = {0x07u, 0x31u, 0x2Fu};
+    static const char* const tags[] = {"c07", "c31", "c2f"};
+    for(size_t i = 0; i < sizeof(polys) / sizeof(polys[0]); i++) {
+        if(radiotchi_crc8(frame, dlen, polys[i], 0x00u) == chk) {
+            strncpy(out_tag, tags[i], tag_len - 1);
+            out_tag[tag_len - 1] = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
+// CRC-validated device-sensor decoder: slice the frame to bytes (mark-coded OOK PWM, or the 2FSK
+// NRZ-with-repeat demod), and ONLY accept it as a sensor when a known CRC validates over the frame.
+// Because the bytes are repeat-confirmed AND CRC-checked, this reaches VALUES with high confidence
+// and graduates to a structurally-named family `sensor-<mod>-<n>B-<crc>-<band>` (e.g.
+// "sensor-fsk-5B-c31-868") — a new dex species per (modulation, length, CRC, band) class. The OOK
+// length floor keeps fixed-code remotes (<= 4 bytes) in the `ook-fixed` family, not here.
+// Privacy (A5): species is a structural family; the frame only seeds a one-way per-device tag.
+static bool
+    decode_crc_sensor(uint32_t band, Modulation mod, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    uint8_t frame[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t nbits = 0;
+    uint16_t nbytes = 0;
+    const char* modtag = NULL;
+
+    if(mod == MOD_OOK) {
+        if(!radiotchi_pwm_to_bytes(pulses, n, frame, sizeof(frame), &nbits)) return false;
+        nbytes = (uint16_t)((nbits + 7u) / 8u);
+        if(nbytes < 5u) return false; // below this is the fixed-code remote regime (avoid overlap)
+        modtag = "ook";
+    } else if(mod == MOD_2FSK) {
+        if(!radiotchi_fsk_sensor_decode(pulses, n, frame, RADIOTCHI_FSK_FRAME_MAX, &nbytes))
+            return false;
+        if(nbytes < 4u) return false;
+        modtag = "fsk";
+    } else {
+        return false;
+    }
+
+    char tag[8];
+    if(!sensor_crc_valid(frame, nbytes, tag, sizeof(tag))) return false;
+
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, "Sensor-CRC", sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    snprintf(
+        ev->species_id, sizeof(ev->species_id), "sensor-%s-%uB-%s-%u", modtag, (unsigned)nbytes,
+        tag, (unsigned)band);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    radiotchi_individual_fingerprint_bytes(frame, nbytes, ev->individual, sizeof(ev->individual));
+    return true;
+}
+
+bool radiotchi_decode_from_pulses(
+    uint32_t frequency_hz,
+    Modulation modulation,
+    const int16_t* pulses,
+    uint16_t n,
+    CaptureEvent* ev) {
+    if(ev == NULL || pulses == NULL || n == 0) return false;
+    uint32_t band = band_bucket_mhz(frequency_hz);
+
+    // Specific, CRC-validated device decoders first (graduate to a named family), then the generic
+    // fixed-code / sensor families. Order = specificity; the first match wins.
+    if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
+
+    if(modulation == MOD_OOK) {
+        return decode_ook_fixed(band, pulses, n, ev);
+    } else if(modulation == MOD_2FSK) {
+        return decode_fsk_sensor(band, pulses, n, ev);
+    }
+    return false;
+}
+
 // --- assembly --------------------------------------------------------------
 
 CaptureEvent analyze_capture(
@@ -912,52 +1155,14 @@ CaptureEvent analyze_capture(
         // in ev.individual).
         radiotchi_species_for_protocol(
             raw->fw_protocol, ev.frequency_hz, ev.species_id, sizeof(ev.species_id));
-    } else if(raw->modulation == MOD_OOK && raw->pulse_count > 0) {
-        uint32_t code = 0;
-        uint8_t nbits = 0;
-        bool got = false;
-        if(radiotchi_ook_pwm_decode(raw->pulses, raw->pulse_count, &code, &nbits)) {
-            // Clean PWM: we read the ACTUAL code -> a stable, privacy-safe per-device tag.
-            radiotchi_individual_fingerprint(code, nbits, ev.individual, sizeof(ev.individual));
-            got = true;
-        } else if(radiotchi_manchester_decode(raw->pulses, raw->pulse_count, &code, &nbits)) {
-            // Manchester fixed-code: bit-level decoded, so (unlike the coarse repeating-frame
-            // fingerprint below) it yields a trustworthy per-device tag.
-            radiotchi_individual_fingerprint(code, nbits, ev.individual, sizeof(ev.individual));
-            got = true;
-        } else if(radiotchi_repeating_frame(raw->pulses, raw->pulse_count, NULL)) {
-            // A confirmed repeating remote of an encoding we don't bit-decode (e.g. Manchester):
-            // reach VALUES, but emit NO individual tag. The waveform fingerprint is too coarse
-            // to be a trustworthy per-device id (it collides across different buttons of one
-            // remote, validated on hardware), so surfacing it would be misleading. A real
-            // per-device id for these needs the firmware's protocol decoders (D28; TB.1).
-            got = true; // ev.individual stays ""
-        }
-        if(got) {
-            ev.decode_tier = TIER_VALUES;
-            strncpy(ev.protocol, WV_PROTO_OOK_FIXED, sizeof(ev.protocol) - 1);
-            ev.protocol[sizeof(ev.protocol) - 1] = '\0';
-            snprintf(
-                ev.species_id, sizeof(ev.species_id), "ook-fixed-%u",
-                (unsigned)band_bucket_mhz(ev.frequency_hz));
-            ev.species_id[sizeof(ev.species_id) - 1] = '\0';
-        }
-    } else if(raw->modulation == MOD_2FSK && raw->pulse_count > 0) {
-        // Structured 2FSK sensor (weather/telemetry/TPMS): demodulate the PCM/NRZ frame from
-        // the pulse timing -> TIER_VALUES. Privacy (A5): the species stays family-level
-        // (fsk-sensor-<band>); the decoded frame only justifies the tier and a one-way tag.
-        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
-        uint16_t flen = 0;
-        if(radiotchi_fsk_sensor_decode(raw->pulses, raw->pulse_count, frame, sizeof(frame), &flen)) {
-            ev.decode_tier = TIER_VALUES;
-            strncpy(ev.protocol, WV_PROTO_FSK_SENSOR, sizeof(ev.protocol) - 1);
-            ev.protocol[sizeof(ev.protocol) - 1] = '\0';
-            snprintf(
-                ev.species_id, sizeof(ev.species_id), "fsk-sensor-%u",
-                (unsigned)band_bucket_mhz(ev.frequency_hz));
-            ev.species_id[sizeof(ev.species_id) - 1] = '\0';
-            radiotchi_individual_fingerprint_bytes(frame, flen, ev.individual, sizeof(ev.individual));
-        }
+    } else if(
+        (raw->modulation == MOD_OOK || raw->modulation == MOD_2FSK) && raw->pulse_count > 0) {
+        // Demodulate the pulse train through the shared decoder dispatch: specific CRC-validated
+        // device decoders first, then the generic fixed-code / sensor families -> TIER_VALUES.
+        // Privacy (A5): species stay family/brand-level; any decoded code only justifies the tier
+        // and a one-way per-device tag. (Same path the `.sub` re-grade uses, so results match.)
+        radiotchi_decode_from_pulses(
+            raw->frequency_hz, raw->modulation, raw->pulses, raw->pulse_count, &ev);
     }
 
     // Carry the raw .sub reference across the boundary so the Game Shell can link

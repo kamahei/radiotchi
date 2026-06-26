@@ -156,7 +156,16 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   e.g. `gate-came-433`, `keyfob-starline-433`; per-device serial stays in the hashed tag, A5).
   Host-tested (167 checks) + FAP builds clean; on-device FSK-reception + Manchester validation
   pending. Remaining: a real-capture FSK/Manchester regression fixture + more framings/families,
-  and preamble/length-aware Manchester framing.)*
+  and preamble/length-aware Manchester framing. **2026-06-26: decoder-extensibility foundation
+  landed** (D37) — a pure **decoder toolkit** (`radiotchi_crc8`/`checksum8`/`xor8`/`bits_get`/
+  `pwm_to_bytes`), a single shared **`radiotchi_decode_from_pulses`** dispatch used by both live
+  capture and the `.sub` re-grade (existing decoders wrapped, zero behaviour change), and a
+  **CRC-validated generic sensor decoder** that reaches VALUES on any standard-CRC sensor and
+  graduates to a structural `sensor-<mod>-<n>B-<crc>-<band>` species (a new dex entry per device
+  class), with the OOK length floor keeping fixed-code remotes in `ook-fixed`. `SPECIES_INDEX_MAX`
+  128→256. Host-tested (185 checks). Fast-follow: named-model decoders (Nexus/Acurite/Oregon/
+  LaCrosse/TPMS) once real captures confirm signatures, a Manchester→bytes slicer, and GFSK/MSK in
+  the sweep.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

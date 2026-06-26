@@ -571,51 +571,16 @@ static uint16_t read_sub_pulses(Storage* storage, const char* sub_path, int16_t*
     return pc;
 }
 
-// Retroactive VALUES: re-read the lossless `.sub` timing and run the real decoder for the
-// capture's modulation (OOK PWM / repeating-frame, or the 2FSK sensor demod). On success the
-// event jumps to TIER_VALUES with the family-level protocol/species (never a per-device id).
+// Retroactive VALUES: re-read the lossless `.sub` timing and run the SAME shared decoder dispatch
+// the live capture uses (`radiotchi_decode_from_pulses`) — so every decoder (current and future)
+// upgrades stored captures identically. On success the event jumps to TIER_VALUES with the
+// family/brand-level protocol/species (never a per-device id surfaced; A5).
 static void try_values_from_sub(Storage* storage, const char* sub_path, CaptureEvent* ev) {
     int16_t pulses[RADIOTCHI_PULSES_MAX];
     uint16_t pc = read_sub_pulses(storage, sub_path, pulses, RADIOTCHI_PULSES_MAX);
     if(pc == 0) return;
 
-    if(ev->modulation == MOD_2FSK) {
-        uint8_t frame[RADIOTCHI_FSK_FRAME_MAX];
-        uint16_t flen = 0;
-        if(radiotchi_fsk_sensor_decode(pulses, pc, frame, sizeof(frame), &flen)) {
-            radiotchi_individual_fingerprint_bytes(frame, flen, ev->individual, sizeof(ev->individual));
-            ev->decode_tier = TIER_VALUES;
-            strncpy(ev->protocol, "FSK-Sensor", sizeof(ev->protocol) - 1);
-            ev->protocol[sizeof(ev->protocol) - 1] = '\0';
-            snprintf(
-                ev->species_id, sizeof(ev->species_id), "fsk-sensor-%lu",
-                (unsigned long)(ev->frequency_hz / 1000000u));
-            ev->scores.nourishment = radiotchi_tier_nourishment(TIER_VALUES);
-        }
-        return;
-    }
-
-    // OOK fixed-code: the PWM bit decoder (with a per-device tag), else a confirmed repeating
-    // remote of an encoding we don't bit-decode (VALUES, but no misleading individual).
-    uint32_t code = 0;
-    uint8_t nbits = 0;
-    bool got = false;
-    if(radiotchi_ook_pwm_decode(pulses, pc, &code, &nbits)) {
-        radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
-        got = true;
-    } else if(radiotchi_manchester_decode(pulses, pc, &code, &nbits)) {
-        radiotchi_individual_fingerprint(code, nbits, ev->individual, sizeof(ev->individual));
-        got = true;
-    } else if(radiotchi_repeating_frame(pulses, pc, NULL)) {
-        got = true; // ev->individual stays as-is (empty for a fresh re-grade)
-    }
-    if(got) {
-        ev->decode_tier = TIER_VALUES;
-        strncpy(ev->protocol, "OOK-FixedCode", sizeof(ev->protocol) - 1);
-        ev->protocol[sizeof(ev->protocol) - 1] = '\0';
-        snprintf(
-            ev->species_id, sizeof(ev->species_id), "ook-fixed-%lu",
-            (unsigned long)(ev->frequency_hz / 1000000u));
+    if(radiotchi_decode_from_pulses(ev->frequency_hz, ev->modulation, pulses, pc, ev)) {
         ev->scores.nourishment = radiotchi_tier_nourishment(TIER_VALUES);
     }
 }
