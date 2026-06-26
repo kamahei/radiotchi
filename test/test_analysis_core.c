@@ -1171,6 +1171,44 @@ static void test_select_by_individual(void) {
     CHECK(n2 == 2 && o2[0] == a0 && o2[1] == a1, "selection is deterministic");
 }
 
+// Deterministic LCG (no libc rand, reproducible across platforms) for the fuzz harness.
+static uint32_t fuzz_lcg(uint32_t* s) {
+    *s = (*s) * 1664525u + 1013904223u;
+    return *s;
+}
+
+// Property/fuzz guard: a large batch of pseudo-random pulse trains must NEVER reach TIER_VALUES.
+// Every value decoder is gated by a repeat-confirm and/or a CRC/constant, so independent random
+// noise (which does not repeat) must not fake a decode. This is a far stronger false-positive net
+// than the single real-noise fixture, and it exercises the whole dispatch (OOK + 2FSK, all bands).
+static void test_fuzz_noise(void) {
+    printf("fuzz noise:\n");
+    uint32_t seed = 0xC0FFEE11u;
+    const int trials = 4000;
+    int false_values = 0;
+    int16_t buf[RADIOTCHI_PULSES_MAX];
+    static const uint32_t bands[] = {315000000u, 433920000u, 868350000u};
+
+    for(int t = 0; t < trials; t++) {
+        uint16_t len = (uint16_t)(40u + (fuzz_lcg(&seed) % (RADIOTCHI_PULSES_MAX - 40u)));
+        for(uint16_t i = 0; i < len; i++) {
+            uint32_t mag = 80u + (fuzz_lcg(&seed) % 8000u); // 80..8079 us
+            buf[i] = (i & 1u) ? (int16_t)(-(int32_t)mag) : (int16_t)mag; // alternate mark/space
+        }
+        RawCapture r;
+        memset(&r, 0, sizeof(r));
+        r.frequency_hz = bands[fuzz_lcg(&seed) % 3u];
+        r.modulation = (fuzz_lcg(&seed) & 1u) ? MOD_OOK : MOD_2FSK;
+        attach_pulses(&r, buf, len);
+        CaptureEvent ev = analyze_capture(&r, NULL, 1);
+        if(ev.decode_tier == TIER_VALUES) {
+            false_values++;
+            if(false_values <= 3) printf("  unexpected VALUES: species=%s\n", ev.species_id);
+        }
+    }
+    CHECK(false_values == 0, "random noise never reaches VALUES across 4000 trials");
+}
+
 int main(void) {
     printf("== Radiotchi analysis_core host tests ==\n");
     test_entropy();
@@ -1202,6 +1240,7 @@ int main(void) {
     test_individual_fingerprint_bytes();
     test_byte_diff();
     test_select_by_individual();
+    test_fuzz_noise();
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

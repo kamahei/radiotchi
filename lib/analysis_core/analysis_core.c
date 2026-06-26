@@ -410,6 +410,8 @@ bool radiotchi_manchester_decode(
 #define WV_FSK_GAP_FLOOR 4000u // ...or an absolute several-ms inter-frame gap
 #define WV_FSK_MIN_BITS  16u // a real sensor frame, not a stray blip
 #define WV_FSK_RUN_CAP   32u // one NRZ run expanding past this is anomalous (not clean PCM)
+#define WV_FSK_MIN_RUNS  6u // a real PCM frame toggles often; reject trivial 1-2 run noise frames
+                            // (coarse run-quantization lets two such frames collide — fuzz finding)
 
 // Decode the first NRZ frame at pulses[start] into packed bytes (MSB-first). A frame ends
 // at the long inter-frame gap. Returns the bit length via *nbits and the index just past the
@@ -428,6 +430,7 @@ static bool decode_fsk_frame(
     for(uint16_t b = 0; b < cap; b++) bytes[b] = 0;
 
     uint16_t count = 0; // bits accumulated
+    uint16_t runs = 0; // level runs (transitions) consumed in this frame
     uint16_t i = start;
     bool started = false;
     for(; i < n; i++) {
@@ -441,6 +444,7 @@ static bool decode_fsk_frame(
             continue; // leading silence before the frame: skip it
         }
         started = true;
+        runs++;
         uint32_t runbits = (mag + bit_period / 2u) / bit_period; // round to whole bits
         if(runbits < 1u) runbits = 1u;
         if(runbits > WV_FSK_RUN_CAP) return false; // not a clean NRZ run
@@ -451,6 +455,7 @@ static bool decode_fsk_frame(
         }
     }
     if(count < WV_FSK_MIN_BITS) return false;
+    if(runs < WV_FSK_MIN_RUNS) return false; // too few transitions => not a real PCM frame
     if(nbits) *nbits = count;
     if(next) *next = i;
     return true;
@@ -483,9 +488,15 @@ bool radiotchi_fsk_sensor_decode(
     if(nb0 != nb1) return false;
     uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);
     if(nbytes > fcap) nbytes = fcap;
+    bool all_same = true;
     for(uint16_t i = 0; i < nbytes; i++) {
         if(f0[i] != f1[i]) return false; // frames disagree => distrust
+        if(f0[i] != f0[0]) all_same = false;
     }
+    // Reject an all-identical frame (all-0 / all-1): a single long mark/space run between two gaps
+    // expands to a uniform byte string, and noise that happens to repeat that shape would otherwise
+    // fake a frame. A real sensor payload varies. (Found by the random-pulse fuzz harness.)
+    if(all_same) return false;
     for(uint16_t i = 0; i < nbytes; i++) frame[i] = f0[i];
     if(frame_len) *frame_len = nbytes;
     return true;
