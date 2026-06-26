@@ -14,8 +14,15 @@ CORE    := ../lib/analysis_core
 GAME    := ../src/game_shell
 BUILD   := build
 
-.PHONY: all test clean
+.PHONY: all test clean sub_analyze
 all: test
+
+# Offline `.sub` decode analyzer (a dev tool, not a test): `make -C test sub_analyze` then run
+# `test/build/sub_analyze <capture.sub>` to see the full pure-core verdict + per-slicer diagnostics.
+sub_analyze: $(BUILD)/sub_analyze
+$(BUILD)/sub_analyze: ../tools/sub_analyze.c $(CORE)/analysis_core.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -I$(CORE) $^ -o $@
 
 $(BUILD)/test_analysis_core: test_analysis_core.c $(CORE)/analysis_core.c
 	@mkdir -p $(BUILD)
