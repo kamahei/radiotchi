@@ -1723,18 +1723,28 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
     }
     if(P == 0u) return false;
 
-    // Known Oregon v2.1 sensors -> {sensor_id, checksum nibble index, species}. Temp-only and
-    // temp+humidity are distinct dex species. Each entry is real-validated against an rtl_433 capture.
+    // Known Oregon sensors -> {sensor_id LOW 12 bits, checksum nibble index, species}. Match the low
+    // 12 bits only: the v3 sensors roll their top id nibble. Species is by VALUE CLASS (temp /
+    // temp+hum / wind / UV), so each class is a distinct dex entry. Each entry is real-validated
+    // against an rtl_433 capture (THN132N, THGR122N, RTHN129, RTGN318, WGR968, UVR128).
     static const struct {
-        uint16_t id;
+        uint16_t id12;
         int cidx;
         const char* species;
     } ore_tab[] = {
-        {0xEC40u, 12, "weather-oregon-433"}, // THN132N: temperature only
-        {0x1D20u, 15, "th-oregon-433"}, // THGR122N: temperature + humidity
+        {0xC40u, 12, "weather-oregon-433"}, // THN132N  temperature
+        {0xC43u, 12, "weather-oregon-433"}, // THN129   temperature
+        {0xCD3u, 12, "weather-oregon-433"}, // RTHN129  temperature
+        {0xD20u, 15, "th-oregon-433"}, // THGR122N temperature + humidity
+        {0xD30u, 15, "th-oregon-433"}, // THGR968  temperature + humidity
+        {0xCC3u, 15, "th-oregon-433"}, // RTGN318  temperature + humidity
+        {0xC70u, 12, "uv-oregon-433"}, // UVR128   UV index
+        // NOTE: longer Oregon frames whose checksum sits late (WGR968 wind ~idx17, BTHR918 pressure
+        // ~idx19) expand past the 256-pulse buffer before the check byte, so they are deferred until
+        // that buffer can grow (needs on-device stack validation). UVR128's check is early, so it fits.
     };
 
-    for(uint16_t off = P; off <= (uint16_t)(P + 20u) && (uint16_t)(off + 2u) < blen; off++) {
+    for(uint16_t off = P; off <= (uint16_t)(P + 24u) && (uint16_t)(off + 2u) < blen; off++) {
         // Inner Manchester (high->low = 1) -> message bits -> reflected nibbles.
         uint8_t msg[16];
         memset(msg, 0, sizeof(msg));
@@ -1749,9 +1759,9 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
         uint16_t mbytes = (uint16_t)(mc / 8u);
         for(uint16_t i = 0; i < mbytes; i++) msg[i] = ore_reflect_nibbles(msg[i]);
 
-        uint16_t sid = (uint16_t)((msg[0] << 8) | msg[1]);
+        uint16_t sid = (uint16_t)(((msg[0] << 8) | msg[1]) & 0x0FFFu); // low 12 bits (v3 id rolls)
         for(size_t t = 0; t < sizeof(ore_tab) / sizeof(ore_tab[0]); t++) {
-            if(sid != ore_tab[t].id) continue;
+            if(sid != ore_tab[t].id12) continue;
             int idx = ore_tab[t].cidx;
             // Highest byte the checksum reads: msg[idx>>1] (+ msg[(idx+1)>>1] for an odd index).
             uint16_t need = (uint16_t)((idx >> 1) + ((idx & 1) ? 2 : 1));

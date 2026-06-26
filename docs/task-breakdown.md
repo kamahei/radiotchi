@@ -245,10 +245,16 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   leading noise (resetting on short fragments) instead of aborting on the first anomalous run. The
   cu8->sub converter also gained glitch-coalescing (a hard magnitude threshold splits a pulse on every
   1-sample dip, inflating the raw count so a real burst overflowed the 256-pulse buffer; real CC1101
-  hysteresis does not). Both species are covered by committed synthetic fixtures. Host 235 checks.
-  Remaining: more Oregon models (table-driven on sensor_id), a dedicated Fine Offset WH24 decoder (its
-  longer CRC+checksum frame and the crude converter's 1-bit onset alignment keep it at recognition),
-  GFSK/MSK reception, and the benign input-handler mutex discipline in `radiotchi_app.c`.)*
+  hysteresis does not). Both species are covered by committed synthetic fixtures. **The table then grew
+  (matching the LOW 12 bits of sensor_id, since v3 sensors roll their top nibble) and species are now
+  by VALUE CLASS**: RTHN129 (temp) and RTGN318 (temp+hum) join the existing species, and **UVR128 adds
+  a new `uv-oregon-433`** — all real-validated via a parallel multi-agent capture survey. Longer Oregon
+  frames whose check byte sits late (WGR968 wind ~idx17, BTHR918 pressure ~idx19) expand past the
+  256-pulse buffer before the checksum, so wind/pressure are deferred until that buffer can grow (needs
+  on-device stack validation). Host 237 checks. Remaining: wind/pressure (buffer), a dedicated Fine
+  Offset WH2/WH24 decoder (custom mark-width OOK the generic slicers miss), Acurite-Tower (592TXR,
+  sum-checksum), GFSK/MSK reception, and the benign input-handler mutex discipline in
+  `radiotchi_app.c`.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

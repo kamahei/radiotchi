@@ -36,6 +36,7 @@ int main(void) {
     CHECK(strcmp(lbl("th-nexus-433"), "Nexus 433") == 0, "nexus -> Nexus 433");
     CHECK(strcmp(lbl("weather-oregon-433"), "Oregon 433") == 0, "oregon -> Oregon 433");
     CHECK(strcmp(lbl("th-oregon-433"), "Oregon TH 433") == 0, "oregon-th -> Oregon TH 433");
+    CHECK(strcmp(lbl("uv-oregon-433"), "Oregon UV 433") == 0, "oregon-uv -> Oregon UV 433");
 
     // Generic structural sensors -> a short, readable type + band.
     CHECK(strcmp(lbl("sensor-2dd4-4B-c31-868"), "FSK sns 868") == 0, "2dd4 -> FSK sns 868");

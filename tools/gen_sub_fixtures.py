@@ -190,6 +190,15 @@ def main():
     f = oregon_v2_frame(om2)
     write_sub(os.path.join(out_dir, "oregon_thgr122n_433.sub"), 433920000, ook, [f, f])
 
+    # Oregon UVR128 (v2.1 UV sensor): sensor_id low 12 bits 0xC70, a 12-nibble (even) sum check ->
+    # uv-oregon-433 (a distinct UV species). Synthetic. (The real UVR128 frame is longer, but its check
+    # byte is early, so a short frame round-trips through the same decoder path.)
+    ouv = [0xEC, 0x70, 0x12, 0x30, 0x04, 0x50, 0x00]
+    us = sum((b >> 4) + (b & 0xF) for b in ouv[:6]) & 0xFF
+    ouv[6] = ((us & 0xF) << 4) | (us >> 4)
+    f = oregon_v2_frame(ouv)
+    write_sub(os.path.join(out_dir, "oregon_uvr128_433.sub"), 433920000, ook, [f, f])
+
     # Generic CRC FSK sensor: 5 bytes, byte 4 = CRC-8/0x31 over bytes 0..3 -> sensor-fsk-5B-c31-868.
     s = bytes([0xA1, 0xB2, 0xC3, 0xD4, 0x00])
     s = bytes(s[:4]) + bytes([crc8(s[:4], poly=0x31)])
