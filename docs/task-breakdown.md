@@ -163,9 +163,15 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   **CRC-validated generic sensor decoder** that reaches VALUES on any standard-CRC sensor and
   graduates to a structural `sensor-<mod>-<n>B-<crc>-<band>` species (a new dex entry per device
   class), with the OOK length floor keeping fixed-code remotes in `ook-fixed`. `SPECIES_INDEX_MAX`
-  128→256. Host-tested (185 checks). Fast-follow: named-model decoders (Nexus/Acurite/Oregon/
-  LaCrosse/TPMS) once real captures confirm signatures, a Manchester→bytes slicer, and GFSK/MSK in
-  the sweep.)*
+  128→256. Host-tested (185 checks). **2026-06-26: first named device decoders landed** (D38) —
+  **Acurite-606** (433 OOK PWM, CRC-8/0x07 gated → `weather-acurite-433`) and **Nexus-TH** (433 OOK
+  PPM, constant-0xF-nibble gated → `th-nexus-433`), plus a new `radiotchi_ppm_to_bytes` slicer.
+  Each reimplemented from public layouts, gated on a documented invariant so non-matching frames
+  fall through safely. A **random-pulse fuzz harness** (`test_fuzz_noise`, 4000 trials) then
+  hardened `radiotchi_fsk_sensor_decode` against two false-positive paths (all-identical frames;
+  trivially few-transition frames via `WV_FSK_MIN_RUNS`). Host-tested (201 checks). Fast-follow:
+  more named models (Oregon/LaCrosse/TPMS) as captures/specs are confirmed, a Manchester→bytes
+  slicer with sync-word search, and GFSK/MSK in the sweep.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
