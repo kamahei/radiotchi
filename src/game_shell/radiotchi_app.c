@@ -1132,6 +1132,16 @@ static void name_edit_cycle(RadiotchiApp* app, int dir) {
     view_port_update(app->view_port);
 }
 
+// Threading contract: on_key runs on the app's MAIN loop thread (radiotchi_app() drains the input
+// queue), which is the SOLE writer of the model. The UI-navigation fields it mutates here
+// (menu_open/sel/scroll, settings_sel, species_sel/scroll, capture_sel/scroll, name_cursor/edit,
+// dbg_*) are deliberately MAIN-THREAD-OWNED and updated without the mutex: the only concurrent
+// readers (draw_callback on the GUI thread, anim_timer_callback on the timer thread) take the mutex
+// and bounds-check every index, and the writes are word/byte-aligned (atomic on Cortex-M), so a
+// concurrent read sees at worst a one-frame (sel, scroll) skew — never a torn value or OOB. The
+// stateful commit paths that DO cross into shared/persisted state (set_screen, do_feed, do_eat,
+// commit_name, apply_tuning, ...) take the mutex themselves; on_key must NOT hold it across those
+// calls (the mutex is non-recursive — that would deadlock). Keep that split when editing here.
 static void on_key(RadiotchiApp* app, InputKey key, InputType type, bool* running) {
     // Long-press Back on the resting Home view exits the app (ui-spec.md §1).
     if(app->model.screen == ScreenHome && !app->model.menu_open && key == InputKeyBack &&
