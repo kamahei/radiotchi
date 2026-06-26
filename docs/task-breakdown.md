@@ -251,10 +251,14 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   a new `uv-oregon-433`** — all real-validated via a parallel multi-agent capture survey. Longer Oregon
   frames whose check byte sits late (WGR968 wind ~idx17, BTHR918 pressure ~idx19) expand past the
   256-pulse buffer before the checksum, so wind/pressure are deferred until that buffer can grow (needs
-  on-device stack validation). Host 237 checks. Remaining: wind/pressure (buffer), a dedicated Fine
-  Offset WH2/WH24 decoder (custom mark-width OOK the generic slicers miss), Acurite-Tower (592TXR,
-  sum-checksum), GFSK/MSK reception, and the benign input-handler mutex discipline in
-  `radiotchi_app.c`.)*
+  on-device stack validation). Host 237 checks. **`decode_fineoffset_wh2` followed** (a NEW family):
+  Fine Offset WH2 is mark-width PWM (SHORT mark = 1, LONG = 0, constant gap) the generic
+  complementary-PWM slicer misses; an all-ones preamble + a 0x04 type nibble + a CRC-8/0x31 frame
+  `[type][id][temp][humidity][crc]` -> a new `th-fineoffset-433` species, real-validated against an
+  rtl_433 WH2 capture (id 209, 24.6 C, 33%) and fixture-covered (host 239). Remaining: wind/pressure
+  Oregon (buffer), Acurite-Tower (592TXR, sum-checksum), more Fine Offset (WH1080/Telldus share the
+  mark-PWM family but differ in framing), GFSK/MSK reception, and the benign input-handler mutex
+  discipline in `radiotchi_app.c`.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

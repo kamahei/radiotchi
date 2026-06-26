@@ -1781,6 +1781,100 @@ static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, C
     return false;
 }
 
+// Named device decoder — Fine Offset Electronics WH2 (and Telldus / WH2A rebrands) temperature +
+// humidity sensor (433.92 MHz OOK). Public layout: mark-width PWM (a SHORT mark = 1, a LONG mark = 0,
+// with a CONSTANT gap), an all-ones preamble (>= one 0xFF byte), then 5 bytes:
+// [type:4 = 0x04][id:8][temp:12 sign-magnitude][humidity:8][CRC-8 poly 0x31 over the first 4]. The
+// generic PWM slicer misses it because the gap is constant, not complementary. Accept only on the
+// preamble + the 0x04 type nibble + the CRC. VALIDATED against a real rtl_433 WH2 capture (id 209,
+// 24.6 C, 33%). -> "th-fineoffset-433"; the id only seeds the one-way per-device tag (A5). Pure.
+#define FO_BITS_MAX 256u
+
+// Smallest well-supported positive-pulse width (the short mark), used to set the short/long threshold.
+static uint32_t fo_short_mark(const int16_t* pulses, uint16_t n) {
+    uint16_t maxsup = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        if(pulses[i] <= 0) continue;
+        uint32_t mi = (uint32_t)pulses[i];
+        uint16_t s = 0;
+        for(uint16_t j = 0; j < n; j++) {
+            if(pulses[j] <= 0) continue;
+            uint32_t mj = (uint32_t)pulses[j];
+            uint32_t d = (mj > mi) ? (mj - mi) : (mi - mj);
+            if(d * 4u <= mi) s++;
+        }
+        if(s > maxsup) maxsup = s;
+    }
+    uint16_t thr = maxsup / 4u;
+    if(thr < 3u) thr = 3u;
+    uint32_t best = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        if(pulses[i] <= 0) continue;
+        uint32_t mi = (uint32_t)pulses[i];
+        if(best != 0u && mi >= best) continue;
+        uint16_t s = 0;
+        for(uint16_t j = 0; j < n; j++) {
+            if(pulses[j] <= 0) continue;
+            uint32_t mj = (uint32_t)pulses[j];
+            uint32_t d = (mj > mi) ? (mj - mi) : (mi - mj);
+            if(d * 4u <= mi) s++;
+        }
+        if(s >= thr) best = mi;
+    }
+    return best;
+}
+
+static bool decode_fineoffset_wh2(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    if(band != 433u || n < 48u) return false;
+    uint32_t shortw = fo_short_mark(pulses, n);
+    if(shortw == 0u) return false;
+    uint32_t thr = shortw * 2u; // a mark below 2x the short width is a 1-bit, otherwise a 0-bit
+
+    // Mark-width bitstream: one bit per positive pulse (short = 1, long = 0).
+    uint8_t bits[FO_BITS_MAX / 8u];
+    memset(bits, 0, sizeof(bits));
+    uint16_t nb = 0;
+    for(uint16_t i = 0; i < n && nb < FO_BITS_MAX; i++) {
+        if(pulses[i] <= 0) continue;
+        if((uint32_t)pulses[i] < thr) bits[nb >> 3] |= (uint8_t)(0x80u >> (nb & 7u));
+        nb++;
+    }
+    if(nb < 48u) return false;
+
+    // Scan for a preamble run of >= 8 ones, then validate the 5-byte frame that follows.
+    uint16_t i = 0;
+    while((uint16_t)(i + 48u) <= nb) {
+        if(ORE_BIT(bits, i) != 1u) {
+            i++;
+            continue;
+        }
+        uint16_t run = 0;
+        while((uint16_t)(i + run) < nb && ORE_BIT(bits, (uint16_t)(i + run)) == 1u) run++;
+        uint16_t ds = (uint16_t)(i + run);
+        if(run >= 8u && (uint16_t)(ds + 40u) <= nb) {
+            uint8_t b[5];
+            for(uint16_t k = 0; k < 5u; k++) {
+                uint8_t v = 0;
+                for(uint16_t t = 0; t < 8u; t++)
+                    v = (uint8_t)((v << 1) | ORE_BIT(bits, (uint16_t)(ds + 8u * k + t)));
+                b[k] = v;
+            }
+            if((b[0] >> 4) == 4u && radiotchi_crc8(b, 4, 0x31u, 0x00u) == b[4]) {
+                ev->decode_tier = TIER_VALUES;
+                strncpy(ev->protocol, "FineOffset-WH2", sizeof(ev->protocol) - 1);
+                ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+                strncpy(ev->species_id, "th-fineoffset-433", sizeof(ev->species_id) - 1);
+                ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+                uint8_t id = (uint8_t)(((b[0] & 0x0Fu) << 4) | ((b[1] & 0xF0u) >> 4));
+                radiotchi_individual_fingerprint_bytes(&id, 1, ev->individual, sizeof(ev->individual));
+                return true;
+            }
+        }
+        i = (run > 0u) ? (uint16_t)(i + run) : (uint16_t)(i + 1u);
+    }
+    return false;
+}
+
 bool radiotchi_decode_from_pulses(
     uint32_t frequency_hz,
     Modulation modulation,
@@ -1804,6 +1898,7 @@ bool radiotchi_decode_from_pulses(
     if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_nexus_th(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_oregon_v2(band, pulses, n, ev)) return true;
+    if(modulation == MOD_OOK && decode_fineoffset_wh2(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_manch_sensor(band, pulses, n, ev)) return true;
     if(modulation == MOD_2FSK && decode_fsk_sync_sensor(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;

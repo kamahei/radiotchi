@@ -88,7 +88,7 @@ void radiotchi_species_label(const char* species_id, char* out, size_t out_len) 
     } kFamilies[] = {
         {"weather-acurite", "Acurite"}, {"th-nexus", "Nexus"},
         {"weather-oregon", "Oregon"},   {"th-oregon", "Oregon TH"},
-        {"uv-oregon", "Oregon UV"},
+        {"uv-oregon", "Oregon UV"},     {"th-fineoffset", "FineOfst"},
         {"sensor-2dd4", "FSK sns"},     {"sensor-ook", "OOK sns"},
         {"sensor-fsk", "FSK sns"},      {"sensor-manch", "Manch sns"},
         {"fsk-sensor", "FSK sns"},      {"ook-fixed", "Fixed"},

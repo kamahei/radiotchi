@@ -124,6 +124,18 @@ def oregon_v2_frame(msg, mark_h=420, space_h=560, gap=5000):
     return out
 
 
+def fineoffset_wh2_frame(b4, short=480, lng=1460, gap=1020):
+    """Fine Offset WH2 mark-width PWM: 0xFF preamble byte + 4 data bytes + CRC-8/0x31, where each bit
+    is one mark (SHORT = 1, LONG = 0) followed by a constant gap. The encoder inverse of
+    decode_fineoffset_wh2."""
+    frame = [0xFF] + list(b4) + [crc8(b4, poly=0x31)]
+    out = []
+    for byte in frame:
+        for i in range(7, -1, -1):
+            out += [short if ((byte >> i) & 1) else lng, -gap]
+    return out
+
+
 def fsk_nrz_frame(data, nbits, period=100, gap=8000):
     """2FSK PCM/NRZ run-length: coalesce equal consecutive bits into one run of count*period
     (sign + for 1, - for 0), then a long inter-frame gap. Mirrors build_fsk_frame."""
@@ -198,6 +210,12 @@ def main():
     ouv[6] = ((us & 0xF) << 4) | (us >> 4)
     f = oregon_v2_frame(ouv)
     write_sub(os.path.join(out_dir, "oregon_uvr128_433.sub"), 433920000, ook, [f, f])
+
+    # Fine Offset WH2 (433 OOK mark-width PWM): 0xFF preamble + 4 bytes [type 0x04][id][temp][humidity]
+    # + CRC-8/0x31 -> th-fineoffset-433. Synthetic id 0x55, 21.0 C, 44%.
+    wh2 = bytes([0x45, 0x50, 0xD2, 0x2C])  # type=4, id=0x55, temp_raw=0xD2=210, humidity=0x2C=44
+    f = fineoffset_wh2_frame(wh2)
+    write_sub(os.path.join(out_dir, "fineoffset_wh2_433.sub"), 433920000, ook, [f, f])
 
     # Generic CRC FSK sensor: 5 bytes, byte 4 = CRC-8/0x31 over bytes 0..3 -> sensor-fsk-5B-c31-868.
     s = bytes([0xA1, 0xB2, 0xC3, 0xD4, 0x00])
