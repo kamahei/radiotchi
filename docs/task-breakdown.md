@@ -231,12 +231,17 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   mis-rounds the wider polarity's full bit to 3 half-bits and collapses the phase pairing (the slicer
   recovered NOTHING on the real capture). Fixed: estimate the half-bit width separately per polarity
   (`man_half_for`, cluster-supported) and classify each run as exactly 1 or 2 half-bits against its own
-  width (clean Manchester is never wider). Oregon now slices to clean Manchester bits, though full
-  Oregon VALUES needs a dedicated decoder (v2.1 bit-doubling + nibble-sum checksum + LSB nibble order)
-  beyond the generic Manchester-CRC sensor. Host 231 checks. Remaining: a named Oregon decoder, a
-  dedicated Fine Offset WH24 decoder (its longer CRC+checksum frame and the crude converter's 1-bit
-  onset alignment keep it at recognition), GFSK/MSK reception, and the benign input-handler mutex
-  discipline in `radiotchi_app.c` (single-core atomic).)*
+  width (clean Manchester is never wider). **A named `decode_oregon_v2` followed**: Oregon Scientific
+  v2.1 is double-Manchester (an outer Manchester chip stream whose post-preamble payload is itself
+  Manchester-encoded, then nibbles bit-reversed), checked by a nibble-sum checksum (not a CRC). The
+  decoder slices the outer Manchester, finds the preamble end, and over a small offset window runs the
+  inner Manchester + reflect + checksum, accepting only a known `sensor_id` with a valid checksum ->
+  `weather-oregon-433` (id in the hashed tag, A5). VALIDATED against the real THN132N capture (id 231,
+  ch 4, 18.0 C, byte-exact to rtl_433) and covered by a committed synthetic fixture. Host 233 checks.
+  Remaining: more Oregon models (the decoder is table-driven on sensor_id), a dedicated Fine Offset
+  WH24 decoder (its longer CRC+checksum frame and the crude converter's 1-bit onset alignment keep it
+  at recognition), GFSK/MSK reception, and the benign input-handler mutex discipline in
+  `radiotchi_app.c` (single-core atomic).)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so

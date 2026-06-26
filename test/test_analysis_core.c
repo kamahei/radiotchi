@@ -1444,6 +1444,7 @@ static void test_named_sub_fixtures(void) {
     } cases[] = {
         {"fixtures/synthetic/acurite_606_433.sub", 433920000u, MOD_OOK, "weather-acurite-433"},
         {"fixtures/synthetic/nexus_th_433.sub", 433920000u, MOD_OOK, "th-nexus-433"},
+        {"fixtures/synthetic/oregon_thn132n_433.sub", 433920000u, MOD_OOK, "weather-oregon-433"},
         {"fixtures/synthetic/sensor_crc_868.sub", 868350000u, MOD_2FSK, "sensor-fsk-5B-c31-868"},
         {"fixtures/synthetic/sensor_2dd4_868.sub", 868350000u, MOD_2FSK, "sensor-2dd4-4B-c31-868"},
     };

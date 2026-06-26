@@ -1590,6 +1590,151 @@ static bool decode_nexus_th(uint32_t band, const int16_t* pulses, uint16_t n, Ca
     return true;
 }
 
+// Named device decoder — Oregon Scientific v2.1 weather sensors (433.92 MHz OOK, double-Manchester).
+// Public layout: an OUTER Manchester chip stream (alternating 0x55/0xAA preamble) whose post-preamble
+// payload is ITSELF Manchester-encoded; after the inner decode the nibbles are bit-reversed (reflect),
+// giving msg = [sensor_id:16][channel:4][device_id+flags][BCD temperature ...][nibble-sum checksum].
+// We slice the outer Manchester to chips (per-polarity half-bit widths), find the preamble end, then
+// over a small offset window run the inner Manchester + nibble-reflect and accept ONLY when the
+// sensor_id is a known type AND the Oregon nibble-sum checksum validates (16-bit type + 8-bit checksum
+// => negligible false accept). VALIDATED against a real rtl_433 THN132N capture (id 231, ch 4, 18.0 C).
+// -> "weather-oregon-433"; the device_id only seeds the one-way per-device tag (A5), values are never
+// surfaced. Pure, libm-free.
+#define ORE_SAMP_MAX 512u
+#define ORE_BIT(arr, i) (((arr)[(i) >> 3] >> (7u - ((i) & 7u))) & 1u)
+
+// Reverse the bit order within each of the two nibbles of a byte (rtl_433 reflect_nibbles).
+static uint8_t ore_reflect_nibbles(uint8_t x) {
+    uint8_t r = 0;
+    for(int s = 0; s <= 4; s += 4) {
+        uint8_t nib = (uint8_t)((x >> s) & 0x0fu);
+        uint8_t rev =
+            (uint8_t)(((nib & 1u) << 3) | ((nib & 2u) << 1) | ((nib & 4u) >> 1) | ((nib & 8u) >> 3));
+        r = (uint8_t)(r | (rev << s));
+    }
+    return r;
+}
+
+// Oregon v2.1/v3 integrity: a 1-byte sum-of-nibbles over the first `idx` nibbles, compared to the
+// checksum byte (its two nibbles swapped). Mirrors rtl_433 validate_os_checksum exactly.
+static bool ore_checksum_ok(const uint8_t* msg, int idx) {
+    uint32_t sum = 0;
+    for(int i = 0; i + 1 < idx; i += 2) {
+        uint8_t val = msg[i >> 1];
+        sum += (uint32_t)((val >> 4) + (val & 0x0fu));
+    }
+    uint8_t ck;
+    if(idx & 1) {
+        sum += (uint32_t)(msg[idx >> 1] >> 4);
+        ck = (uint8_t)((msg[idx >> 1] & 0x0fu) | (msg[(idx + 1) >> 1] & 0xf0u));
+    } else {
+        ck = (uint8_t)((msg[idx >> 1] >> 4) | ((msg[idx >> 1] & 0x0fu) << 4));
+    }
+    return (uint8_t)(sum & 0xffu) == ck;
+}
+
+static bool decode_oregon_v2(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    if(band != 433u || n < 64u) return false;
+    uint32_t mark_half = man_half_for(pulses, n, true);
+    uint32_t space_half = man_half_for(pulses, n, false);
+    if(mark_half == 0u || space_half == 0u) return false;
+    uint32_t gap = space_half * WV_MAN_GAP_MULT;
+    if(gap < WV_MAN_GAP_FLOOR) gap = WV_MAN_GAP_FLOOR;
+
+    // Outer Manchester -> half-bit sample stream (packed, MSB-first), first frame only.
+    uint8_t samp[ORE_SAMP_MAX / 8u];
+    memset(samp, 0, sizeof(samp));
+    uint16_t m = 0;
+    bool started = false;
+    for(uint16_t i = 0; i < n && m < ORE_SAMP_MAX; i++) {
+        uint32_t mag = abs32(pulses[i]);
+        if(mag < WV_MAN_GLITCH_US) continue;
+        if(mag >= gap) {
+            if(started) break;
+            continue;
+        }
+        uint8_t level = (pulses[i] > 0) ? 1u : 0u;
+        uint32_t half = level ? mark_half : space_half;
+        uint32_t q = (mag < (half * 3u) / 2u) ? 1u : ((mag < half * 3u) ? 2u : 0u);
+        if(q == 0u) return false; // not clean Manchester
+        started = true;
+        for(uint32_t r = 0; r < q && m < ORE_SAMP_MAX; r++) {
+            if(level) samp[m >> 3] |= (uint8_t)(0x80u >> (m & 7u));
+            m++;
+        }
+    }
+    if(m < 64u) return false;
+
+    // Phase-pair the samples into the chip stream b (low->high = 1); the correct framing pairs every
+    // (a,b) as a transition, so take the phase with the longer unbroken run.
+    uint8_t b[ORE_SAMP_MAX / 16u];
+    uint16_t blen = 0;
+    for(uint8_t phase = 0; phase < 2; phase++) {
+        uint8_t tmp[ORE_SAMP_MAX / 16u];
+        memset(tmp, 0, sizeof(tmp));
+        uint16_t cnt = 0;
+        for(uint16_t k = phase; (uint16_t)(k + 1) < m; k += 2) {
+            uint8_t a = (uint8_t)ORE_BIT(samp, k), bb = (uint8_t)ORE_BIT(samp, (uint16_t)(k + 1));
+            if(a == bb) break;
+            if(a == 0u) tmp[cnt >> 3] |= (uint8_t)(0x80u >> (cnt & 7u));
+            cnt++;
+        }
+        if(cnt > blen) {
+            blen = cnt;
+            memcpy(b, tmp, sizeof(b));
+        }
+    }
+    if(blen < 56u) return false;
+
+    // Preamble end = the first repeated chip after >= 16 alternating chips.
+    uint16_t P = 0;
+    for(uint16_t i = 0; (uint16_t)(i + 1) < blen; i++) {
+        if(i >= 16u && ORE_BIT(b, i) == ORE_BIT(b, (uint16_t)(i + 1))) {
+            P = i;
+            break;
+        }
+    }
+    if(P == 0u) return false;
+
+    // Known Oregon v2.1 temperature sensors: sensor_id -> checksum nibble index.
+    static const uint16_t ore_ids[] = {0xEC40u, 0xCC43u}; // THN132N, THN129 (temp-only, 12-nibble cksum)
+    static const int ore_idx[] = {12, 12};
+
+    for(uint16_t off = P; off <= (uint16_t)(P + 20u) && (uint16_t)(off + 2u) < blen; off++) {
+        // Inner Manchester (high->low = 1) -> message bits -> reflected nibbles.
+        uint8_t msg[16];
+        memset(msg, 0, sizeof(msg));
+        uint16_t mc = 0;
+        for(uint16_t k = off; (uint16_t)(k + 1) < blen && mc < 128u; k += 2) {
+            uint8_t a = (uint8_t)ORE_BIT(b, k), bb = (uint8_t)ORE_BIT(b, (uint16_t)(k + 1));
+            if(a == bb) break;
+            if(a == 1u) msg[mc >> 3] |= (uint8_t)(0x80u >> (mc & 7u));
+            mc++;
+        }
+        if(mc < 56u) continue;
+        uint16_t mbytes = (uint16_t)(mc / 8u);
+        for(uint16_t i = 0; i < mbytes; i++) msg[i] = ore_reflect_nibbles(msg[i]);
+
+        uint16_t sid = (uint16_t)((msg[0] << 8) | msg[1]);
+        for(size_t t = 0; t < sizeof(ore_ids) / sizeof(ore_ids[0]); t++) {
+            if(sid != ore_ids[t]) continue;
+            int idx = ore_idx[t];
+            if((uint16_t)((idx + 2) / 2) > mbytes) continue;
+            if(!ore_checksum_ok(msg, idx)) continue;
+            ev->decode_tier = TIER_VALUES;
+            strncpy(ev->protocol, "Oregon-v2", sizeof(ev->protocol) - 1);
+            ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+            strncpy(ev->species_id, "weather-oregon-433", sizeof(ev->species_id) - 1);
+            ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+            // Per-device tag = sensor type + house code only (A5); BCD values are never surfaced.
+            uint8_t idbytes[3] = {msg[0], msg[1], (uint8_t)((msg[2] & 0x0fu) | (msg[3] & 0xf0u))};
+            radiotchi_individual_fingerprint_bytes(idbytes, 3, ev->individual, sizeof(ev->individual));
+            return true;
+        }
+    }
+    return false;
+}
+
 bool radiotchi_decode_from_pulses(
     uint32_t frequency_hz,
     Modulation modulation,
@@ -1612,6 +1757,7 @@ bool radiotchi_decode_from_pulses(
     // first, then the CRC-validated generic sensor, then the generic fixed-code / sensor families.
     if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_nexus_th(band, pulses, n, ev)) return true;
+    if(modulation == MOD_OOK && decode_oregon_v2(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_manch_sensor(band, pulses, n, ev)) return true;
     if(modulation == MOD_2FSK && decode_fsk_sync_sensor(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;

@@ -84,6 +84,46 @@ def acurite_frame(data4, pulse=480, g0=1000, g1=2000, sync=5000):
     return out
 
 
+def oregon_reflect_nibbles(x):
+    """Reverse the bit order within each nibble of a byte (rtl_433 reflect_nibbles)."""
+    r = 0
+    for s in (0, 4):
+        nib = (x >> s) & 0xF
+        r |= (((nib & 1) << 3) | ((nib & 2) << 1) | ((nib & 4) >> 1) | ((nib & 8) >> 3)) << s
+    return r
+
+
+def oregon_v2_frame(msg, mark_h=420, space_h=560, gap=5000):
+    """Oregon Scientific v2.1 double-Manchester (the encoder inverse of decode_oregon_v2): `msg` is the
+    decoder-side reflected message incl. the trailing nibble-sum checksum byte. Reflect back to on-air,
+    inner-Manchester-encode each bit (1->[1,0], 0->[0,1]), prepend an alternating chip preamble, then
+    outer-Manchester-encode each chip (1->[0,1], 0->[1,0]) and run-length to +mark/-space us. Mark and
+    space half-bits differ (real OOK duty-cycle skew), so the fixture also exercises the per-polarity
+    slicer."""
+    air = [oregon_reflect_nibbles(b) for b in msg]
+    inner = []
+    for b in air:
+        for i in range(7, -1, -1):
+            inner += [1, 0] if ((b >> i) & 1) else [0, 1]
+    chips = [0, 1] * 11 + [1, 1] + inner  # alternating preamble + a sync that breaks the alternation
+    halves = []
+    for c in chips:
+        halves += [0, 1] if c else [1, 0]
+    out = []
+    run, cur = 0, None
+    for h in halves:
+        if h == cur:
+            run += 1
+        else:
+            if cur is not None:
+                out.append((1 if cur else -1) * run * (mark_h if cur else space_h))
+            cur, run = h, 1
+    if cur is not None:
+        out.append((1 if cur else -1) * run * (mark_h if cur else space_h))
+    out.append(-gap)
+    return out
+
+
 def fsk_nrz_frame(data, nbits, period=100, gap=8000):
     """2FSK PCM/NRZ run-length: coalesce equal consecutive bits into one run of count*period
     (sign + for 1, - for 0), then a long inter-frame gap. Mirrors build_fsk_frame."""
@@ -130,6 +170,15 @@ def main():
     nx = bytes([0x3A, 0x11, 0x23, 0xF3, 0x70])
     f = ppm_frame(nx, 36)
     write_sub(os.path.join(out_dir, "nexus_th_433.sub"), 433920000, ook, [f, f])
+
+    # Oregon THN132N (v2.1, 433 OOK double-Manchester): sensor_id 0xEC40; the 7th byte is a nibble-sum
+    # checksum (nibbles swapped) over the first six -> weather-oregon-433. Synthetic id/temp (id 0x5A,
+    # 21.0 C). Real coding validated against an rtl_433 THN132N capture.
+    om = [0xEC, 0x40, 0x1A, 0x50, 0x01, 0x20, 0x00]
+    osum = sum((b >> 4) + (b & 0xF) for b in om[:6]) & 0xFF
+    om[6] = ((osum & 0xF) << 4) | (osum >> 4)  # checksum byte = nibble-swapped sum
+    f = oregon_v2_frame(om)
+    write_sub(os.path.join(out_dir, "oregon_thn132n_433.sub"), 433920000, ook, [f, f])
 
     # Generic CRC FSK sensor: 5 bytes, byte 4 = CRC-8/0x31 over bytes 0..3 -> sensor-fsk-5B-c31-868.
     s = bytes([0xA1, 0xB2, 0xC3, 0xD4, 0x00])
