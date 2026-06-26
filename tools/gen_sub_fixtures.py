@@ -115,6 +115,13 @@ def main():
     f = fsk_nrz_frame(s, 40)
     write_sub(os.path.join(out_dir, "sensor_crc_868.sub"), 868350000, fsk, [f, f])
 
+    # Preamble + 0x2DD4 sync FSK sensor (Fine Offset/Ecowitt-class): 0xAA 0xAA 0x2D 0xD4 + 3 data +
+    # CRC-8/0x31 over the data -> sensor-2dd4-4B-c31-868.
+    sd = bytes([0x11, 0x22, 0x33])
+    sframe = bytes([0xAA, 0xAA, 0x2D, 0xD4]) + sd + bytes([crc8(sd, poly=0x31)])
+    f = fsk_nrz_frame(sframe, len(sframe) * 8)
+    write_sub(os.path.join(out_dir, "sensor_2dd4_868.sub"), 868350000, fsk, [f, f])
+
 
 if __name__ == "__main__":
     main()

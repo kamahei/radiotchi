@@ -200,6 +200,14 @@ uint8_t radiotchi_xor8(const uint8_t* data, uint16_t len);
 // is expected to have length-checked. Pure.
 uint32_t radiotchi_bits_get(const uint8_t* bytes, uint16_t nbytes, uint16_t bit_off, uint8_t nbits);
 
+// Search the MSB-first bit stream `bytes` (`nbits` valid bits) for the `sync_nbits`-bit pattern
+// `sync` (held in the low bits). Returns the bit offset where the DATA begins (just past the first
+// match) so the caller can pull aligned fields with radiotchi_bits_get, or -1 if the sync is absent.
+// The enabler for preamble+sync-framed protocols (the demod gives a bit stream; this finds where the
+// payload starts regardless of byte alignment). Pure.
+int32_t radiotchi_find_sync(
+    const uint8_t* bytes, uint16_t nbytes, uint16_t nbits, uint32_t sync, uint8_t sync_nbits);
+
 // Demodulate an OOK PWM byte frame (bit set by MARK width: long mark = 1, short = 0; the Acurite/
 // generic OOK-sensor coding), packing MSB-first into `out` (capacity `cap` bytes). Frames split at
 // the long sync gap; a frame is trusted only when an immediately-following repeat packs the SAME

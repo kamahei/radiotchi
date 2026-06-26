@@ -808,6 +808,19 @@ uint32_t radiotchi_bits_get(
     return v;
 }
 
+int32_t radiotchi_find_sync(
+    const uint8_t* bytes, uint16_t nbytes, uint16_t nbits, uint32_t sync, uint8_t sync_nbits) {
+    if(bytes == NULL || sync_nbits == 0 || sync_nbits > 32 || nbits < sync_nbits) return -1;
+    uint32_t mask = (sync_nbits == 32u) ? 0xFFFFFFFFu : ((1u << sync_nbits) - 1u);
+    uint32_t want = sync & mask;
+    for(uint16_t off = 0; (uint16_t)(off + sync_nbits) <= nbits; off++) {
+        if((radiotchi_bits_get(bytes, nbytes, off, sync_nbits) & mask) == want) {
+            return (int32_t)(off + sync_nbits);
+        }
+    }
+    return -1;
+}
+
 // Decode one OOK PWM (mark-coded) frame at pulses[start] into MSB-first bytes (long mark = 1, short
 // = 0; split at 1.5x the short unit, robust even for a 1-terminated last bit since the bit is the
 // MARK not the gap space). Ends at a space >= gap. Returns the bit count via *nbits, the index past
@@ -1308,6 +1321,56 @@ static bool
     return true;
 }
 
+// Preamble + sync-word framed FSK sensor (the Fine Offset / Ecowitt / LaCrosse-class structure the
+// whole-frame CRC sensor can't read, because the preamble breaks a frame-wide CRC). Demodulate the
+// whole NRZ frame, locate the widely-used 0x2DD4 sync word in the bit stream, then CRC-validate the
+// post-sync payload (trying each plausible data length, since the demod may carry trailing bytes).
+// The 16-bit documented sync + an 8-bit CRC make a non-matching frame practically impossible to
+// accept. -> "sensor-2dd4-<n>B-<crc>-<band>". Privacy (A5): structural family + hashed tag. Pure.
+#define WV_FSK_SYNC      0x2DD4u
+#define WV_FSK_SYNC_BITS 16u
+static bool decode_fsk_sync_sensor(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    uint8_t f[RADIOTCHI_FSK_FRAME_MAX];
+    uint16_t flen = 0;
+    if(!radiotchi_fsk_sensor_decode(pulses, n, f, sizeof(f), &flen)) return false;
+    uint16_t nbits = (uint16_t)(flen * 8u);
+    int32_t doff = radiotchi_find_sync(f, flen, nbits, WV_FSK_SYNC, WV_FSK_SYNC_BITS);
+    if(doff < 0) return false;
+
+    // Pull the byte-aligned payload that follows the sync (find_sync gives a bit offset).
+    uint16_t avail = (uint16_t)(nbits - (uint16_t)doff);
+    uint16_t dbytes = (uint16_t)(avail / 8u);
+    if(dbytes < 4u) return false; // >= 3 data + 1 check
+    uint8_t data[RADIOTCHI_FSK_FRAME_MAX];
+    for(uint16_t i = 0; i < dbytes; i++) {
+        data[i] = (uint8_t)radiotchi_bits_get(f, flen, (uint16_t)(doff + (int32_t)(i * 8u)), 8);
+    }
+
+    // The demod may carry trailing bytes past the CRC; try each candidate frame length.
+    char tag[8];
+    for(uint16_t len = 4; len <= dbytes; len++) {
+        bool all_same = true;
+        for(uint16_t i = 1; i < len; i++) {
+            if(data[i] != data[0]) {
+                all_same = false;
+                break;
+            }
+        }
+        if(all_same) continue;
+        if(!sensor_crc_valid(data, len, tag, sizeof(tag))) continue;
+        ev->decode_tier = TIER_VALUES;
+        strncpy(ev->protocol, "FSK-Sync", sizeof(ev->protocol) - 1);
+        ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+        snprintf(
+            ev->species_id, sizeof(ev->species_id), "sensor-2dd4-%uB-%s-%u", (unsigned)len, tag,
+            (unsigned)band);
+        ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+        radiotchi_individual_fingerprint_bytes(data, len, ev->individual, sizeof(ev->individual));
+        return true;
+    }
+    return false;
+}
+
 // Named device decoder — Acurite 606TX outdoor thermometer (433.92 MHz OOK PWM). Documented
 // public layout: a 32-bit frame [id:8][flags:8][temp:8 (+4 high bits in flags)][crc:8] whose last
 // byte is CRC-8 (generator 0x07, init 0) over the first three. We gate on the exact length AND a
@@ -1371,6 +1434,7 @@ bool radiotchi_decode_from_pulses(
     if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_nexus_th(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_manch_sensor(band, pulses, n, ev)) return true;
+    if(modulation == MOD_2FSK && decode_fsk_sync_sensor(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
 
     if(modulation == MOD_OOK) {

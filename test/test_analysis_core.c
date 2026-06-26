@@ -612,6 +612,15 @@ static void test_toolkit(void) {
     CHECK(
         mnbits == 16 && mbytes[0] == 0x4Au && mbytes[1] == 0x5Bu,
         "manchester_to_bytes recovers 4A 5B");
+
+    // find_sync: locate a 16-bit sync word after a preamble; return the data bit offset.
+    uint8_t syncbuf[4] = {0xAA, 0x2D, 0xD4, 0x99}; // preamble 0xAA, sync 0x2DD4, then data 0x99
+    CHECK(
+        radiotchi_find_sync(syncbuf, 4, 32, 0x2DD4u, 16) == 24,
+        "find_sync returns the data offset just past 0x2DD4");
+    CHECK(
+        radiotchi_find_sync(syncbuf, 4, 32, 0x1234u, 16) == -1, "find_sync returns -1 when absent");
+    CHECK(radiotchi_bits_get(syncbuf, 4, 24, 8) == 0x99u, "data sits at the find_sync offset");
 }
 
 static void test_parse_raw_data(void) {
@@ -966,6 +975,25 @@ static void test_named_sensors(void) {
         strcmp(evm.species_id, "sensor-manch-5B-c07-433") == 0,
         "Manchester CRC sensor named by len/crc/band");
     CHECK(strncmp(evm.individual, "id-", 3) == 0, "Manchester sensor sets a hashed tag (A5)");
+
+    // Preamble + 0x2DD4 sync + 3 data bytes + CRC-8/0x31 (the Fine Offset/Ecowitt-class structure):
+    // the whole-frame CRC sensor can't read it (preamble breaks a frame-wide CRC), but the
+    // sync-framed decoder locates 0x2DD4 and CRCs the payload -> sensor-2dd4-4B-c31-868.
+    uint8_t sd[3] = {0x11, 0x22, 0x33};
+    uint8_t sframe[8] = {0xAA, 0xAA, 0x2D, 0xD4, sd[0], sd[1], sd[2], radiotchi_crc8(sd, 3, 0x31u, 0)};
+    n = build_fsk_frame(buf, 0, sframe, 64, 100, 8000);
+    n = build_fsk_frame(buf, n, sframe, 64, 100, 8000);
+    RawCapture rs;
+    memset(&rs, 0, sizeof(rs));
+    rs.frequency_hz = 868350000u;
+    rs.modulation = MOD_2FSK;
+    attach_pulses(&rs, buf, n);
+    CaptureEvent evs = analyze_capture(&rs, NULL, 1);
+    CHECK(evs.decode_tier == TIER_VALUES, "preamble+sync FSK sensor reaches VALUES");
+    CHECK(
+        strcmp(evs.species_id, "sensor-2dd4-4B-c31-868") == 0,
+        "sync FSK sensor named by sync/len/crc/band");
+    CHECK(strncmp(evs.individual, "id-", 3) == 0, "sync FSK sensor sets a hashed tag (A5)");
 }
 
 static void test_species_branding(void) {
@@ -1270,6 +1298,7 @@ static void test_named_sub_fixtures(void) {
         {"fixtures/synthetic/acurite_606_433.sub", 433920000u, MOD_OOK, "weather-acurite-433"},
         {"fixtures/synthetic/nexus_th_433.sub", 433920000u, MOD_OOK, "th-nexus-433"},
         {"fixtures/synthetic/sensor_crc_868.sub", 868350000u, MOD_2FSK, "sensor-fsk-5B-c31-868"},
+        {"fixtures/synthetic/sensor_2dd4_868.sub", 868350000u, MOD_2FSK, "sensor-2dd4-4B-c31-868"},
     };
     for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint16_t n = load_sub(cases[i].path, pulses, RADIOTCHI_PULSES_MAX);
