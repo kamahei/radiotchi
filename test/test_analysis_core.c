@@ -1329,21 +1329,27 @@ static uint32_t fuzz_lcg(uint32_t* s) {
 static void test_fuzz_noise(void) {
     printf("fuzz noise:\n");
     uint32_t seed = 0xC0FFEE11u;
-    const int trials = 4000;
+    const int trials = 6000;
     int false_values = 0;
     int16_t buf[RADIOTCHI_PULSES_MAX];
-    static const uint32_t bands[] = {315000000u, 433920000u, 868350000u};
+    static const uint32_t bands[] = {315000000u, 426000000u, 433920000u, 868350000u, 920000000u};
+    static const Modulation mods[] = {MOD_OOK, MOD_2FSK, MOD_GFSK, MOD_MSK};
 
     for(int t = 0; t < trials; t++) {
-        uint16_t len = (uint16_t)(40u + (fuzz_lcg(&seed) % (RADIOTCHI_PULSES_MAX - 40u)));
+        uint16_t len = (uint16_t)(20u + (fuzz_lcg(&seed) % (RADIOTCHI_PULSES_MAX - 20u)));
+        // Per-trial timing regime so a range of bit-period estimates is exercised (fast and slow).
+        uint32_t base = 40u + (fuzz_lcg(&seed) % 600u);
+        uint32_t span = 200u + (fuzz_lcg(&seed) % 9000u);
         for(uint16_t i = 0; i < len; i++) {
-            uint32_t mag = 80u + (fuzz_lcg(&seed) % 8000u); // 80..8079 us
+            uint32_t mag = base + (fuzz_lcg(&seed) % span);
+            // ~1 in 20: a sub-glitch spike (real RX noise) — the glitch filters must absorb it.
+            if((fuzz_lcg(&seed) % 20u) == 0u) mag = 5u + (fuzz_lcg(&seed) % 35u);
             buf[i] = (i & 1u) ? (int16_t)(-(int32_t)mag) : (int16_t)mag; // alternate mark/space
         }
         RawCapture r;
         memset(&r, 0, sizeof(r));
-        r.frequency_hz = bands[fuzz_lcg(&seed) % 3u];
-        r.modulation = (fuzz_lcg(&seed) & 1u) ? MOD_OOK : MOD_2FSK;
+        r.frequency_hz = bands[fuzz_lcg(&seed) % 5u];
+        r.modulation = mods[fuzz_lcg(&seed) % 4u];
         attach_pulses(&r, buf, len);
         CaptureEvent ev = analyze_capture(&r, NULL, 1);
         if(ev.decode_tier == TIER_VALUES) {
@@ -1351,7 +1357,7 @@ static void test_fuzz_noise(void) {
             if(false_values <= 3) printf("  unexpected VALUES: species=%s\n", ev.species_id);
         }
     }
-    CHECK(false_values == 0, "random noise never reaches VALUES across 4000 trials");
+    CHECK(false_values == 0, "random noise never reaches VALUES across 6000 diverse trials");
 }
 
 int main(void) {
