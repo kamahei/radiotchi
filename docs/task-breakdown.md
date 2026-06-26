@@ -169,9 +169,13 @@ Bounded, independently implementable tasks, ordered to reach the MVP vertical sl
   Each reimplemented from public layouts, gated on a documented invariant so non-matching frames
   fall through safely. A **random-pulse fuzz harness** (`test_fuzz_noise`, 4000 trials) then
   hardened `radiotchi_fsk_sensor_decode` against two false-positive paths (all-identical frames;
-  trivially few-transition frames via `WV_FSK_MIN_RUNS`). Host-tested (201 checks). Fast-follow:
-  more named models (Oregon/LaCrosse/TPMS) as captures/specs are confirmed, a Manchester→bytes
-  slicer with sync-word search, and GFSK/MSK in the sweep.)*
+  trivially few-transition frames via `WV_FSK_MIN_RUNS`). Host-tested (201 checks). A spec-driven
+  `.sub` fixture generator (`tools/gen_sub_fixtures.py`) + committed synthetic fixtures now exercise
+  the named/CRC decoders through the real on-disk parse path (207 checks). **`radiotchi_manchester_to_bytes`
+  + a generic Manchester-CRC sensor** (`sensor-manch-<n>B-<crc>-<band>`, the Oregon/TPMS-class
+  encoding) landed, fuzz-confirmed false-positive-free (212 checks). Fast-follow: more named models
+  (Oregon/LaCrosse/TPMS) once real captures confirm signatures, a **bit-level sync-word search** for
+  preamble-framed protocols, and GFSK/MSK in the sweep.)*
 - **TB.2** dex diff-based learning views (static/incrementing/world-varying bytes). *(2026-06-24:
   **individual recurrence** landed — a privacy-safe one-way `id-XXXX` fingerprint of a decoded
   stable code (`CaptureEvent.individual` + log column), shown in the dex captures list/detail so
