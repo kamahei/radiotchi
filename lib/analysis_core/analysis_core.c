@@ -395,6 +395,108 @@ bool radiotchi_manchester_decode(
     return true;
 }
 
+// --- Manchester -> byte frame (for multi-byte Manchester sensors) -----------
+#define WV_MANB_SAMP_MAX 144u // half-bit samples buffered (<= 8 bytes * 8 bits * 2 + slack)
+
+// Decode one Manchester frame at pulses[start] into MSB-first bytes (G.E. Thomas: low->high = 1).
+// Same half-bit reconstruction + phase search as decode_manchester_frame, but packs bytes (so a
+// frame wider than 32 bits round-trips). Returns the bit count via *nbits, the index past the frame
+// via *next; false if no plausible frame / no valid phase.
+static bool decode_manchester_bytes_frame(
+    const int16_t* pulses,
+    uint16_t n,
+    uint16_t start,
+    uint32_t half_unit,
+    uint8_t* out,
+    uint16_t cap_bytes,
+    uint16_t* nbits,
+    uint16_t* next) {
+    uint32_t gap = half_unit * WV_MAN_GAP_MULT;
+    if(gap < WV_MAN_GAP_FLOOR) gap = WV_MAN_GAP_FLOOR;
+
+    uint8_t samp[WV_MANB_SAMP_MAX];
+    uint16_t m = 0;
+    uint16_t i = start;
+    bool started = false;
+    for(; i < n; i++) {
+        uint32_t mag = abs32(pulses[i]);
+        if(mag < WV_MAN_GLITCH_US) continue;
+        if(mag >= gap) {
+            if(started) {
+                i++;
+                break;
+            }
+            continue;
+        }
+        uint32_t q = (mag + half_unit / 2u) / half_unit;
+        if(q < 1u) q = 1u;
+        if(q > WV_MAN_RUN_CAP) return false;
+        uint8_t level = (pulses[i] > 0) ? 1u : 0u;
+        started = true;
+        for(uint32_t r = 0; r < q && m < WV_MANB_SAMP_MAX; r++) samp[m++] = level;
+    }
+    if(m < 16u) return false; // >= 8 bits
+
+    uint16_t cap_bits = (uint16_t)(cap_bytes * 8u);
+    for(uint8_t phase = 0; phase < 2; phase++) {
+        for(uint16_t b = 0; b < cap_bytes; b++) out[b] = 0;
+        uint16_t cnt = 0;
+        bool ok = true;
+        for(uint16_t k = phase; (uint16_t)(k + 1) < m; k += 2) {
+            uint8_t a = samp[k];
+            uint8_t b = samp[k + 1];
+            if(a == b) {
+                ok = false;
+                break;
+            }
+            if(cnt >= cap_bits) {
+                ok = false;
+                break;
+            }
+            if(a == 0u && b == 1u) out[cnt >> 3] |= (uint8_t)(0x80u >> (cnt & 7u));
+            cnt++;
+        }
+        if(ok && cnt >= 16u) {
+            if(nbits) *nbits = cnt;
+            if(next) *next = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool radiotchi_manchester_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits) {
+    if(pulses == NULL || out == NULL || cap == 0 || n < 16u) return false;
+
+    uint32_t half_unit = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        uint32_t m = abs32(pulses[i]);
+        if(m < WV_MAN_GLITCH_US) continue;
+        if(half_unit == 0 || m < half_unit) half_unit = m;
+    }
+    if(half_unit == 0) return false;
+
+    uint8_t f0[8];
+    uint8_t f1[8];
+    uint16_t fcap = cap < 8u ? cap : 8u;
+    uint16_t nb0 = 0, nb1 = 0, next = 0, dummy = 0;
+    if(!decode_manchester_bytes_frame(pulses, n, 0, half_unit, f0, fcap, &nb0, &next)) return false;
+
+    if(next >= n) return false;
+    if(!decode_manchester_bytes_frame(pulses, n, next, half_unit, f1, fcap, &nb1, &dummy))
+        return false;
+    if(nb0 != nb1) return false;
+    uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);
+    if(nbytes > fcap) nbytes = fcap;
+    for(uint16_t i = 0; i < nbytes; i++) {
+        if(f0[i] != f1[i]) return false;
+    }
+    for(uint16_t i = 0; i < nbytes; i++) out[i] = f0[i];
+    if(nbits) *nbits = nb0;
+    return true;
+}
+
 // --- real demodulation: 2FSK sensor frame (PCM/NRZ weather/telemetry/TPMS) -----
 //
 // The firmware's async-RAW slicer turns the 2FSK discriminator output into the SAME
@@ -1170,6 +1272,42 @@ static bool
     return true;
 }
 
+// CRC-validated MANCHESTER sensor decoder (the Oregon/TPMS-class encoding the byte CRC sensor above
+// can not slice). Demodulate the Manchester frame to bytes (repeat-confirmed), then accept only when
+// a known CRC validates over a >=5-byte frame (the floor keeps Manchester fixed-code remotes in
+// ook-fixed). Same all-same + CRC guards as the OOK/FSK sensor paths -> "sensor-manch-<n>B-<crc>
+// -<band>". Privacy (A5): structural family + hashed per-device tag, no surfaced values. Pure.
+static bool
+    decode_manch_sensor(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    uint8_t frame[8];
+    uint16_t nbits = 0;
+    if(!radiotchi_manchester_to_bytes(pulses, n, frame, sizeof(frame), &nbits)) return false;
+    uint16_t nbytes = (uint16_t)((nbits + 7u) / 8u);
+    if(nbytes < 5u) return false; // below this is the fixed-code remote regime
+
+    bool all_same = true;
+    for(uint16_t i = 1; i < nbytes; i++) {
+        if(frame[i] != frame[0]) {
+            all_same = false;
+            break;
+        }
+    }
+    if(all_same) return false;
+
+    char tag[8];
+    if(!sensor_crc_valid(frame, nbytes, tag, sizeof(tag))) return false;
+
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, "Sensor-CRC", sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    snprintf(
+        ev->species_id, sizeof(ev->species_id), "sensor-manch-%uB-%s-%u", (unsigned)nbytes, tag,
+        (unsigned)band);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    radiotchi_individual_fingerprint_bytes(frame, nbytes, ev->individual, sizeof(ev->individual));
+    return true;
+}
+
 // Named device decoder — Acurite 606TX outdoor thermometer (433.92 MHz OOK PWM). Documented
 // public layout: a 32-bit frame [id:8][flags:8][temp:8 (+4 high bits in flags)][crc:8] whose last
 // byte is CRC-8 (generator 0x07, init 0) over the first three. We gate on the exact length AND a
@@ -1232,6 +1370,7 @@ bool radiotchi_decode_from_pulses(
     // first, then the CRC-validated generic sensor, then the generic fixed-code / sensor families.
     if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
     if(modulation == MOD_OOK && decode_nexus_th(band, pulses, n, ev)) return true;
+    if(modulation == MOD_OOK && decode_manch_sensor(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
 
     if(modulation == MOD_OOK) {

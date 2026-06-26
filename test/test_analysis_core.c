@@ -136,6 +136,34 @@ static uint16_t build_manchester_frame(
     return at;
 }
 
+// Append an OOK Manchester frame for the first `nbits` of a byte array (MSB first), G.E. Thomas:
+// bit 1 = low half then high half, bit 0 = high half then low half (`h` = one half-bit µs). The
+// byte-oriented sibling of build_manchester_frame, for frames wider than 32 bits. (For clean edges
+// the first bit should be 0 / high-first and the last bit 1 / high-last, so neither edge half-bit
+// is absorbed by the low inter-frame gap.)
+static uint16_t build_manchester_bytes_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, uint16_t nbits, int16_t h, int16_t gap) {
+    int run = 0;
+    int cur = -1;
+    for(uint16_t i = 0; i < nbits; i++) {
+        int bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        int halves[2] = {bit ? 0 : 1, bit ? 1 : 0};
+        for(int hbi = 0; hbi < 2; hbi++) {
+            int lvl = halves[hbi];
+            if(lvl == cur) {
+                run++;
+            } else {
+                if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)h);
+                cur = lvl;
+                run = 1;
+            }
+        }
+    }
+    if(cur >= 0) out[at++] = (int16_t)((cur ? 1 : -1) * run * (int)h);
+    out[at++] = (int16_t)(-gap);
+    return at;
+}
+
 // Append an OOK PWM frame for the first `nbits` of a byte array (MSB first): bit 0 = short mark +
 // long space, bit 1 = long mark + short space; the last bit's space is the sync `gap`. The
 // byte-oriented sibling of build_pwm_frame, for frames wider than 32 bits (sensor payloads).
@@ -571,6 +599,19 @@ static void test_toolkit(void) {
     CHECK(
         !radiotchi_ppm_to_bytes(buf, pone, pbytes, sizeof(pbytes), &pnbits),
         "ppm_to_bytes rejects a lone frame");
+
+    // manchester_to_bytes: a multi-byte Manchester frame (first bit 0, last bit 1) -> {0x4A, 0x5B}.
+    uint8_t mb[2] = {0x4A, 0x5B};
+    n = build_manchester_bytes_frame(buf, 0, mb, 16, 250, 8000);
+    n = build_manchester_bytes_frame(buf, n, mb, 16, 250, 8000);
+    uint8_t mbytes[8];
+    uint16_t mnbits = 0;
+    CHECK(
+        radiotchi_manchester_to_bytes(buf, n, mbytes, sizeof(mbytes), &mnbits),
+        "manchester_to_bytes decodes");
+    CHECK(
+        mnbits == 16 && mbytes[0] == 0x4Au && mbytes[1] == 0x5Bu,
+        "manchester_to_bytes recovers 4A 5B");
 }
 
 static void test_parse_raw_data(void) {
@@ -902,6 +943,29 @@ static void test_named_sensors(void) {
     // to all-zero bytes under the OOK PWM path, where the all-same guard rejects the trivial
     // zero-CRC (otherwise it would falsely read as sensor-ook-5B-c07-433).
     CHECK(strncmp(evnn.species_id, "sensor-", 7) != 0, "fixed-mark PPM is not a false CRC sensor");
+
+    // Manchester CRC sensor: a 5-byte Manchester frame whose last byte is CRC-8/0x07 over bytes
+    // 0..3 -> sensor-manch-5B-c07-433 (the Manchester-encoded sensor class).
+    uint8_t md[5] = {0x4A, 0x33, 0x1C, 0x05, 0};
+    uint8_t mcrc = radiotchi_crc8(md, 4, 0x07u, 0x00u);
+    // ensure the last data bit (the CRC LSB) is 1 so the Manchester edge isn't absorbed by the gap.
+    for(int guard = 0; (mcrc & 1u) == 0u && guard < 256; guard++) {
+        md[3] = (uint8_t)(md[3] + 1u);
+        mcrc = radiotchi_crc8(md, 4, 0x07u, 0x00u);
+    }
+    md[4] = mcrc;
+    n = build_manchester_bytes_frame(buf, 0, md, 40, 250, 8000);
+    n = build_manchester_bytes_frame(buf, n, md, 40, 250, 8000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent evm = analyze_capture(&r, NULL, 1);
+    CHECK(evm.decode_tier == TIER_VALUES, "Manchester CRC sensor reaches VALUES");
+    CHECK(
+        strcmp(evm.species_id, "sensor-manch-5B-c07-433") == 0,
+        "Manchester CRC sensor named by len/crc/band");
+    CHECK(strncmp(evm.individual, "id-", 3) == 0, "Manchester sensor sets a hashed tag (A5)");
 }
 
 static void test_species_branding(void) {

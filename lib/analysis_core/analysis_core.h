@@ -216,6 +216,13 @@ bool radiotchi_pwm_to_bytes(
 bool radiotchi_ppm_to_bytes(
     const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits);
 
+// Demodulate an OOK Manchester byte frame (G.E. Thomas: low->high = 1) into MSB-first bytes (up to
+// `cap`, max 8). Half-bit reconstruction + transition-phase search (like radiotchi_manchester_decode
+// but byte-packed so a >32-bit sensor frame round-trips), repeat-confirmed. Returns the bit count
+// via *nbits and true on a confirmed frame. Pure.
+bool radiotchi_manchester_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits);
+
 // Run the pulse-based VALUES decoders in priority order on a captured pulse train, filling
 // ev->decode_tier (TIER_VALUES), protocol, species_id and individual on the first that succeeds.
 // Specific device decoders (CRC-validated sensors) are tried BEFORE the generic fixed-code /
