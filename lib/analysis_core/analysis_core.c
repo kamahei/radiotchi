@@ -767,6 +767,83 @@ bool radiotchi_pwm_to_bytes(
     return true;
 }
 
+// --- OOK PPM (space/gap-coded) byte slicer ---------------------------------
+#define WV_PPM_GLITCH_US 40u // ignore sub-40us spikes when estimating the short gap
+#define WV_PPM_GAP_MULT  3u // a space >= this x the short gap (or the floor) ends a frame
+#define WV_PPM_GAP_FLOOR 2000u // ...or an absolute several-ms inter-frame gap
+
+// Decode one PPM frame at pulses[start] (bit = SPACE width: long = 1, short = 0) into MSB-first
+// bytes. Ends at a space >= the sync gap (that terminating bit reads as 1). Returns the bit count
+// via *nbits, the index past the frame via *next; false if too short / overrun.
+static bool decode_ppm_bytes_frame(
+    const int16_t* pulses,
+    uint16_t n,
+    uint16_t start,
+    uint32_t short_space,
+    uint8_t* out,
+    uint16_t cap_bytes,
+    uint16_t* nbits,
+    uint16_t* next) {
+    uint32_t sync_gap = short_space * WV_PPM_GAP_MULT;
+    if(sync_gap < WV_PPM_GAP_FLOOR) sync_gap = WV_PPM_GAP_FLOOR;
+    uint32_t space_thresh = short_space + short_space / 2u; // 1.5x splits short(0) from long(1)
+    uint16_t cap_bits = (uint16_t)(cap_bytes * 8u);
+    for(uint16_t b = 0; b < cap_bytes; b++) out[b] = 0;
+
+    uint16_t count = 0;
+    uint16_t i = start;
+    for(; i + 1 < n; i += 2) {
+        uint32_t space = abs32(pulses[i + 1]); // pulses[i] is the fixed mark; the gap carries the bit
+        if(count >= cap_bits) return false;
+        if(space > space_thresh) out[count >> 3] |= (uint8_t)(0x80u >> (count & 7u));
+        count++;
+        if(space >= sync_gap) { // inter-frame gap ends the frame
+            i += 2;
+            break;
+        }
+    }
+    if(count < 8u) return false;
+    if(nbits) *nbits = count;
+    if(next) *next = i;
+    return true;
+}
+
+bool radiotchi_ppm_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits) {
+    if(pulses == NULL || out == NULL || cap == 0 || n < 16u) return false;
+
+    uint16_t start = 0;
+    if(pulses[0] < 0) start = 1; // begin on a mark
+    // Short gap = the glitch-filtered minimum over SPACES only (the fixed mark would poison a
+    // whole-train min and make every gap read as a "1").
+    uint32_t short_space = 0;
+    for(uint16_t i = start; i < n; i++) {
+        if(pulses[i] >= 0) continue;
+        uint32_t s = abs32(pulses[i]);
+        if(s < WV_PPM_GLITCH_US) continue;
+        if(short_space == 0 || s < short_space) short_space = s;
+    }
+    if(short_space == 0) return false;
+
+    uint8_t f0[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint8_t f1[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t fcap = cap < RADIOTCHI_SENSOR_FRAME_MAX ? cap : RADIOTCHI_SENSOR_FRAME_MAX;
+    uint16_t nb0 = 0, nb1 = 0, next = 0, dummy = 0;
+    if(!decode_ppm_bytes_frame(pulses, n, start, short_space, f0, fcap, &nb0, &next)) return false;
+
+    if(next >= n) return false;
+    if(!decode_ppm_bytes_frame(pulses, n, next, short_space, f1, fcap, &nb1, &dummy)) return false;
+    if(nb0 != nb1) return false;
+    uint16_t nbytes = (uint16_t)((nb0 + 7u) / 8u);
+    if(nbytes > fcap) nbytes = fcap;
+    for(uint16_t i = 0; i < nbytes; i++) {
+        if(f0[i] != f1[i]) return false;
+    }
+    for(uint16_t i = 0; i < nbytes; i++) out[i] = f0[i];
+    if(nbits) *nbits = nb0;
+    return true;
+}
+
 // --- protocol classifier (provisional, signature-based) --------------------
 //
 // The Nourishment ladder needs *something* to raise the tier above RAW. We can not
@@ -1056,6 +1133,18 @@ static bool
         return false;
     }
 
+    // Reject a degenerate all-identical frame (e.g. a fixed-mark PPM sensor mis-sliced here as
+    // all-zero bytes, where CRC-8 of zeros trivially equals the zero check byte). A real sensor
+    // payload varies; an all-same frame carries no value and must not be a false `sensor-*`.
+    bool all_same = true;
+    for(uint16_t i = 1; i < nbytes; i++) {
+        if(frame[i] != frame[0]) {
+            all_same = false;
+            break;
+        }
+    }
+    if(all_same) return false;
+
     char tag[8];
     if(!sensor_crc_valid(frame, nbytes, tag, sizeof(tag))) return false;
 
@@ -1094,6 +1183,31 @@ static bool decode_acurite606(uint32_t band, const int16_t* pulses, uint16_t n, 
     return true;
 }
 
+// Named device decoder — Nexus-TH (and its many clones) outdoor temperature/humidity sensor
+// (433.92 MHz OOK PPM). Documented public layout: 36 bits [id:8][flags:4][temp:12][const:4=0xF]
+// [humidity:8]. The constant 0xF nibble at bits 24..27 is the distinctive validity marker; we gate
+// on it AND a plausible humidity (<= 100) AND the repeat-confirmed PPM framing — so a non-Nexus
+// frame practically never matches. Reaches VALUES / "th-nexus-433"; the id stays in the hashed
+// `individual` tag (A5), the sensor values are never surfaced. Pure.
+static bool decode_nexus_th(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
+    if(band != 433u) return false;
+    uint8_t f[RADIOTCHI_SENSOR_FRAME_MAX];
+    uint16_t nbits = 0;
+    if(!radiotchi_ppm_to_bytes(pulses, n, f, sizeof(f), &nbits)) return false;
+    if(nbits < 36u) return false; // Nexus is a 36-bit frame
+    uint16_t nbytes = (uint16_t)((nbits + 7u) / 8u);
+    if(radiotchi_bits_get(f, nbytes, 24, 4) != 0xFu) return false; // the constant 0xF marker
+    if(radiotchi_bits_get(f, nbytes, 28, 8) > 100u) return false; // humidity in 0..100
+
+    ev->decode_tier = TIER_VALUES;
+    strncpy(ev->protocol, "Nexus-TH", sizeof(ev->protocol) - 1);
+    ev->protocol[sizeof(ev->protocol) - 1] = '\0';
+    strncpy(ev->species_id, "th-nexus-433", sizeof(ev->species_id) - 1);
+    ev->species_id[sizeof(ev->species_id) - 1] = '\0';
+    radiotchi_individual_fingerprint_bytes(f, nbytes, ev->individual, sizeof(ev->individual));
+    return true;
+}
+
 bool radiotchi_decode_from_pulses(
     uint32_t frequency_hz,
     Modulation modulation,
@@ -1106,6 +1220,7 @@ bool radiotchi_decode_from_pulses(
     // Order = specificity; the first match wins. Named device decoders (documented signatures)
     // first, then the CRC-validated generic sensor, then the generic fixed-code / sensor families.
     if(modulation == MOD_OOK && decode_acurite606(band, pulses, n, ev)) return true;
+    if(modulation == MOD_OOK && decode_nexus_th(band, pulses, n, ev)) return true;
     if(decode_crc_sensor(band, modulation, pulses, n, ev)) return true;
 
     if(modulation == MOD_OOK) {

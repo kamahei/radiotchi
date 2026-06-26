@@ -135,6 +135,22 @@ static uint16_t build_pwm_bytes_frame(
     return at;
 }
 
+// Append an OOK PPM frame for the first `nbits` of a byte array (MSB first): each bit = a fixed
+// `pulse` mark then a space (short `s0` = 0, long `s1` = 1); the last bit's space is the sync
+// `gap`. Mirrors the Nexus/weather-sensor space-coded line. (For a clean round-trip the last data
+// bit should be 1, since the sync gap reads as a 1.)
+static uint16_t build_ppm_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, uint16_t nbits, int16_t pulse, int16_t s0,
+    int16_t s1, int16_t gap) {
+    for(uint16_t i = 0; i < nbits; i++) {
+        int bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        out[at++] = pulse;
+        int16_t space = (i == (uint16_t)(nbits - 1)) ? gap : (bit ? s1 : s0);
+        out[at++] = (int16_t)(-space);
+    }
+    return at;
+}
+
 // --- entropy ---------------------------------------------------------------
 
 static void test_entropy(void) {
@@ -525,6 +541,19 @@ static void test_toolkit(void) {
     CHECK(
         !radiotchi_pwm_to_bytes(buf, one, bytes, sizeof(bytes), &nbits),
         "pwm_to_bytes rejects a lone frame");
+
+    // ppm_to_bytes: a space-coded frame ending on a 1-bit -> {0xAB, 0xCD}, repeat-confirmed.
+    uint8_t pb[2] = {0xAB, 0xCD};
+    n = build_ppm_frame(buf, 0, pb, 16, 500, 1000, 2000, 4000);
+    n = build_ppm_frame(buf, n, pb, 16, 500, 1000, 2000, 4000);
+    uint8_t pbytes[8];
+    uint16_t pnbits = 0;
+    CHECK(radiotchi_ppm_to_bytes(buf, n, pbytes, sizeof(pbytes), &pnbits), "ppm_to_bytes decodes");
+    CHECK(pnbits == 16 && pbytes[0] == 0xABu && pbytes[1] == 0xCDu, "ppm_to_bytes recovers AB CD");
+    uint16_t pone = build_ppm_frame(buf, 0, pb, 16, 500, 1000, 2000, 4000);
+    CHECK(
+        !radiotchi_ppm_to_bytes(buf, pone, pbytes, sizeof(pbytes), &pnbits),
+        "ppm_to_bytes rejects a lone frame");
 }
 
 static void test_parse_raw_data(void) {
@@ -826,6 +855,36 @@ static void test_named_sensors(void) {
     attach_pulses(&r, buf, n);
     CaptureEvent ev3 = analyze_capture(&r, NULL, 1);
     CHECK(strcmp(ev3.species_id, "weather-acurite-433") != 0, "Acurite gated to its 433 band");
+
+    // Nexus-TH: a 36-bit OOK PPM frame with the constant 0xF nibble at bits 24..27 and humidity 55
+    // (id 0x3A, flags 0x1, temp 0x123, const 0xF, humidity 0x37). Last data bit is 1 (sync-clean).
+    uint8_t nx[5] = {0x3A, 0x11, 0x23, 0xF3, 0x70};
+    n = build_ppm_frame(buf, 0, nx, 36, 500, 1000, 2000, 4000);
+    n = build_ppm_frame(buf, n, nx, 36, 500, 1000, 2000, 4000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent evn = analyze_capture(&r, NULL, 1);
+    CHECK(evn.decode_tier == TIER_VALUES, "Nexus-TH frame reaches VALUES");
+    CHECK(strcmp(evn.species_id, "th-nexus-433") == 0, "Nexus-TH names a th species");
+    CHECK(strcmp(evn.protocol, "Nexus-TH") == 0, "Nexus-TH protocol named");
+    CHECK(strncmp(evn.individual, "id-", 3) == 0, "Nexus sets a hashed per-device tag (A5)");
+
+    // A 36-bit PPM frame WITHOUT the 0xF marker nibble must not be named Nexus (no false label).
+    uint8_t nnx[5] = {0x3A, 0x11, 0x23, 0x73, 0x70}; // const nibble 0x7, not 0xF
+    n = build_ppm_frame(buf, 0, nnx, 36, 500, 1000, 2000, 4000);
+    n = build_ppm_frame(buf, n, nnx, 36, 500, 1000, 2000, 4000);
+    memset(&r, 0, sizeof(r));
+    r.frequency_hz = 433920000u;
+    r.modulation = MOD_OOK;
+    attach_pulses(&r, buf, n);
+    CaptureEvent evnn = analyze_capture(&r, NULL, 1);
+    CHECK(strcmp(evnn.species_id, "th-nexus-433") != 0, "no 0xF marker => not named Nexus");
+    // ...and it must NOT be mislabeled a generic CRC sensor either: the fixed-mark PPM frame slices
+    // to all-zero bytes under the OOK PWM path, where the all-same guard rejects the trivial
+    // zero-CRC (otherwise it would falsely read as sensor-ook-5B-c07-433).
+    CHECK(strncmp(evnn.species_id, "sensor-", 7) != 0, "fixed-mark PPM is not a false CRC sensor");
 }
 
 static void test_species_branding(void) {

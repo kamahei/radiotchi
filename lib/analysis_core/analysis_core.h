@@ -207,6 +207,15 @@ uint32_t radiotchi_bits_get(const uint8_t* bytes, uint16_t nbytes, uint16_t bit_
 bool radiotchi_pwm_to_bytes(
     const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits);
 
+// Demodulate an OOK PPM byte frame where the BIT is set by the SPACE (gap) width after a fixed
+// sync pulse (short gap = 0, long gap = 1; the Nexus/weather-sensor coding), packing MSB-first into
+// `out` (capacity `cap` bytes). The short-gap unit is estimated over the SPACES only (the fixed
+// mark would poison it); frames split at the long inter-frame gap (its terminating bit reads as 1).
+// Repeat-confirmed like the others. Returns the bit count via *nbits and true on a confirmed frame.
+// Pure.
+bool radiotchi_ppm_to_bytes(
+    const int16_t* pulses, uint16_t n, uint8_t* out, uint16_t cap, uint16_t* nbits);
+
 // Run the pulse-based VALUES decoders in priority order on a captured pulse train, filling
 // ev->decode_tier (TIER_VALUES), protocol, species_id and individual on the first that succeeds.
 // Specific device decoders (CRC-validated sensors) are tried BEFORE the generic fixed-code /
