@@ -89,12 +89,17 @@ static void analyze(const char* path) {
         (unsigned long)freq, band, preset[0] ? preset : "?", mod_name(mod), n,
         n > RADIOTCHI_PULSES_MAX ? " (on-device decodes first 256)" : "");
 
+    // Glitch-coalesce the train (the same pre-pass the dispatch applies) so the diagnostics match
+    // the verdict and a real capture's slicer dips don't desync the pair-walking PWM/PPM slicers.
+    int16_t clean[RADIOTCHI_PULSES_MAX];
+    dn = radiotchi_coalesce_glitches(pulses, dn, clean, RADIOTCHI_PULSES_MAX, 60u);
+
     // The headline verdict: the shared pulse-decode dispatch (specific decoders -> generic families).
     CaptureEvent ev;
     memset(&ev, 0, sizeof(ev));
     ev.frequency_hz = freq;
     ev.modulation = mod;
-    bool decoded = radiotchi_decode_from_pulses(freq, mod, pulses, dn, &ev);
+    bool decoded = radiotchi_decode_from_pulses(freq, mod, clean, dn, &ev);
     if(decoded) {
         printf(
             "  VERDICT: tier=%s protocol=%s species=%s indiv=%s\n", tier_name(ev.decode_tier),
@@ -108,44 +113,44 @@ static void analyze(const char* path) {
     int shown = 0;
     uint32_t code = 0;
     uint8_t nbits = 0;
-    if(radiotchi_ook_pwm_decode(pulses, dn, &code, &nbits)) {
+    if(radiotchi_ook_pwm_decode(clean, dn, &code, &nbits)) {
         printf("    ook_pwm_decode:      code=0x%lX nbits=%u\n", (unsigned long)code, nbits);
         shown++;
     }
-    if(radiotchi_manchester_decode(pulses, dn, &code, &nbits)) {
+    if(radiotchi_manchester_decode(clean, dn, &code, &nbits)) {
         printf("    manchester_decode:   code=0x%lX nbits=%u\n", (unsigned long)code, nbits);
         shown++;
     }
 
     uint8_t bytes[64];
     uint16_t nb = 0;
-    if(radiotchi_pwm_to_bytes(pulses, dn, bytes, sizeof(bytes), &nb)) {
+    if(radiotchi_pwm_to_bytes(clean, dn, bytes, sizeof(bytes), &nb)) {
         printf("    pwm_to_bytes (%2ub):  ", nb);
         hexdump(bytes, (uint16_t)((nb + 7) / 8));
         printf("\n");
         shown++;
     }
-    if(radiotchi_ppm_to_bytes(pulses, dn, bytes, sizeof(bytes), &nb)) {
+    if(radiotchi_ppm_to_bytes(clean, dn, bytes, sizeof(bytes), &nb)) {
         printf("    ppm_to_bytes (%2ub):  ", nb);
         hexdump(bytes, (uint16_t)((nb + 7) / 8));
         printf("\n");
         shown++;
     }
-    if(radiotchi_manchester_to_bytes(pulses, dn, bytes, sizeof(bytes), &nb)) {
+    if(radiotchi_manchester_to_bytes(clean, dn, bytes, sizeof(bytes), &nb)) {
         printf("    manch_to_bytes(%2ub): ", nb);
         hexdump(bytes, (uint16_t)((nb + 7) / 8));
         printf("\n");
         shown++;
     }
     uint16_t flen = 0;
-    if(radiotchi_fsk_sensor_decode(pulses, dn, bytes, sizeof(bytes), &flen)) {
+    if(radiotchi_fsk_sensor_decode(clean, dn, bytes, sizeof(bytes), &flen)) {
         printf("    fsk_sensor (%2uB):    ", flen);
         hexdump(bytes, flen);
         printf("\n");
         shown++;
     }
     uint16_t fp = 0;
-    if(radiotchi_repeating_frame(pulses, dn, &fp)) {
+    if(radiotchi_repeating_frame(clean, dn, &fp)) {
         printf("    repeating_frame:     id-%04x\n", fp);
         shown++;
     }

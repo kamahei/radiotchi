@@ -196,6 +196,24 @@ static uint16_t build_ppm_frame(
     return at;
 }
 
+// Append one Acurite-606-style frame: a leading sync gap, then 32 gap/PPM bits (fixed pulse +
+// short gap = 0 / long gap = 1), then a trailing sync gap that delimits the frame. Mirrors the
+// real coding validated against rtl_433 captures (sync ~2.3x the long data gap).
+static uint16_t build_acurite_frame(
+    int16_t* out, uint16_t at, const uint8_t* bytes, int16_t pulse, int16_t g0, int16_t g1,
+    int16_t sync) {
+    out[at++] = pulse;
+    out[at++] = (int16_t)(-sync); // leading sync
+    for(int i = 0; i < 32; i++) {
+        int bit = (bytes[i >> 3] >> (7 - (i & 7))) & 1;
+        out[at++] = pulse;
+        out[at++] = (int16_t)(-(bit ? g1 : g0));
+    }
+    out[at++] = pulse;
+    out[at++] = (int16_t)(-sync); // trailing sync (frame delimiter)
+    return at;
+}
+
 // --- entropy ---------------------------------------------------------------
 
 static void test_entropy(void) {
@@ -629,6 +647,21 @@ static void test_toolkit(void) {
     CHECK(
         radiotchi_find_sync(syncbuf, 4, 32, 0x1234u, 16) == -1, "find_sync returns -1 when absent");
     CHECK(radiotchi_bits_get(syncbuf, 4, 24, 8) == 0x99u, "data sits at the find_sync offset");
+
+    // lfsr_digest8: the real Acurite-606 vector A3 80 65 -> 0xEA (rtl_433 lfsr_digest8(b,3,0x98,0xf1)).
+    uint8_t av[3] = {0xA3, 0x80, 0x65};
+    CHECK(radiotchi_lfsr_digest8(av, 3, 0x98u, 0xf1u) == 0xEAu, "lfsr_digest8 matches the Acurite vector");
+
+    // coalesce_glitches: a sub-glitch space splitting a pulse ([200, -4, 288, -980]) merges to
+    // [488, -980]; a clean train is unchanged.
+    int16_t gin[4] = {200, -4, 288, -980};
+    int16_t gout[8];
+    uint16_t gn = radiotchi_coalesce_glitches(gin, 4, gout, 8, 60u);
+    CHECK(gn == 2 && gout[0] == 488 && gout[1] == -980, "coalesce merges a glitch-split pulse");
+    int16_t cin[4] = {476, -980, 492, -1952};
+    gn = radiotchi_coalesce_glitches(cin, 4, gout, 8, 60u);
+    CHECK(
+        gn == 4 && gout[0] == 476 && gout[3] == -1952, "coalesce leaves a clean train unchanged");
 }
 
 static void test_parse_raw_data(void) {
@@ -891,11 +924,11 @@ static void test_named_sensors(void) {
     printf("named sensors:\n");
     int16_t buf[256];
 
-    // Acurite 606TX: a 32-bit OOK PWM frame whose last byte is CRC-8/0x07 over the first three.
-    uint8_t f[4] = {0x3A, 0x21, 0x84, 0};
-    f[3] = radiotchi_crc8(f, 3, 0x07u, 0x00u);
-    uint16_t n = build_pwm_bytes_frame(buf, 0, f, 32, 350, 1050, 10500);
-    n = build_pwm_bytes_frame(buf, n, f, 32, 350, 1050, 10500); // repeat (confidence)
+    // Acurite 606TX: gap/PPM 32-bit frame, last byte = LFSR-8 digest(b,3,0x98,0xf1) over the first
+    // three (the real coding/checksum, validated against rtl_433 captures — id 0x55 is synthetic).
+    uint8_t f[4] = {0x55, 0x80, 0x65, 0};
+    f[3] = radiotchi_lfsr_digest8(f, 3, 0x98u, 0xf1u);
+    uint16_t n = build_acurite_frame(buf, 0, f, 480, 1000, 2000, 5000);
     RawCapture r;
     memset(&r, 0, sizeof(r));
     r.frequency_hz = 433920000u;
@@ -907,23 +940,19 @@ static void test_named_sensors(void) {
     CHECK(strcmp(ev.protocol, "Acurite-606") == 0, "Acurite-606 protocol named");
     CHECK(strncmp(ev.individual, "id-", 3) == 0, "Acurite sets a hashed per-device tag (A5)");
 
-    // A 32-bit OOK frame whose 4th byte is NOT the Acurite CRC must NOT be named Acurite — it stays
-    // in the generic ook-fixed family (no false model labeling).
-    uint8_t bad[4] = {0x3A, 0x21, 0x84, 0};
-    uint8_t crc = radiotchi_crc8(bad, 3, 0x07u, 0x00u);
-    bad[3] = (uint8_t)(crc ^ 0xFFu); // guaranteed != the Acurite CRC
-    n = build_pwm_bytes_frame(buf, 0, bad, 32, 350, 1050, 10500);
-    n = build_pwm_bytes_frame(buf, n, bad, 32, 350, 1050, 10500);
+    // A frame whose 4th byte is NOT the Acurite LFSR digest must NOT be named Acurite.
+    uint8_t bad[4] = {0x55, 0x80, 0x65, 0};
+    bad[3] = (uint8_t)(radiotchi_lfsr_digest8(bad, 3, 0x98u, 0xf1u) ^ 0xFFu); // != the digest
+    n = build_acurite_frame(buf, 0, bad, 480, 1000, 2000, 5000);
     memset(&r, 0, sizeof(r));
     r.frequency_hz = 433920000u;
     r.modulation = MOD_OOK;
     attach_pulses(&r, buf, n);
     CaptureEvent ev2 = analyze_capture(&r, NULL, 1);
-    CHECK(strcmp(ev2.species_id, "ook-fixed-433") == 0, "non-Acurite 32-bit frame stays ook-fixed");
+    CHECK(strcmp(ev2.species_id, "weather-acurite-433") != 0, "bad-digest frame is not named Acurite");
 
     // Band guard: the same Acurite frame on a non-433 band is not named Acurite.
-    n = build_pwm_bytes_frame(buf, 0, f, 32, 350, 1050, 10500);
-    n = build_pwm_bytes_frame(buf, n, f, 32, 350, 1050, 10500);
+    n = build_acurite_frame(buf, 0, f, 480, 1000, 2000, 5000);
     memset(&r, 0, sizeof(r));
     r.frequency_hz = 315000000u;
     r.modulation = MOD_OOK;

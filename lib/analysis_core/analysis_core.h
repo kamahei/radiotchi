@@ -195,10 +195,25 @@ uint8_t radiotchi_checksum8(const uint8_t* data, uint16_t len);
 // 8-bit XOR of `data[0..len)`. Pure.
 uint8_t radiotchi_xor8(const uint8_t* data, uint16_t len);
 
+// Galois-LFSR 8-bit digest (the rtl_433 `lfsr_digest8` form): for each message bit MSB-first, XOR
+// the running key into the sum when the bit is set, then advance the key by the generator `gen`.
+// Used by several sensor families (e.g. Acurite-606 = digest(b,3,0x98,0xf1) == b[3]) as their
+// integrity check. `init` is the starting key. Pure.
+uint8_t radiotchi_lfsr_digest8(const uint8_t* data, uint16_t len, uint8_t gen, uint8_t init);
+
 // Extract a big-endian bit field of `nbits` (1..32) starting at bit offset `bit_off` from a
 // MSB-first byte buffer (bit 0 = MSB of byte 0). Bits beyond the buffer read as 0 — the caller
 // is expected to have length-checked. Pure.
 uint32_t radiotchi_bits_get(const uint8_t* bytes, uint16_t nbytes, uint16_t bit_off, uint8_t nbits);
+
+// Coalesce glitches in a signed pulse train: drop every run shorter than `glitch_us` and merge the
+// same-sign runs it had separated (a momentary slicer dip splits one pulse into `[200, -4, 288]`,
+// which would otherwise desync the pair-walking PWM/PPM slicers). Writes the cleaned train into
+// `out` (capacity `cap`) and returns its length. Real RX/IQ slicers produce these spikes; the
+// element-by-element decoders glitch-filter already, this makes the pair-based ones equally robust.
+// Pure.
+uint16_t radiotchi_coalesce_glitches(
+    const int16_t* in, uint16_t n, int16_t* out, uint16_t cap, uint16_t glitch_us);
 
 // Search the MSB-first bit stream `bytes` (`nbits` valid bits) for the `sync_nbits`-bit pattern
 // `sync` (held in the low bits). Returns the bit offset where the DATA begins (just past the first

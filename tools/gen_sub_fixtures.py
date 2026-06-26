@@ -63,6 +63,27 @@ def ppm_frame(data, nbits, pulse=500, s0=1000, s1=2000, gap=4000):
     return out
 
 
+def lfsr_digest8(msg, gen=0x98, key=0xf1):
+    """Galois-LFSR 8-bit digest (rtl_433 lfsr_digest8) — Acurite-606 etc. integrity check."""
+    s = 0
+    for b in msg:
+        for i in range(7, -1, -1):
+            if (b >> i) & 1:
+                s ^= key
+            key = ((key >> 1) ^ gen) if (key & 1) else (key >> 1)
+    return s & 0xFF
+
+
+def acurite_frame(data4, pulse=480, g0=1000, g1=2000, sync=5000):
+    """Acurite-606 gap/PPM: leading sync gap, 32 bits (mark + short gap=0 / long gap=1), trailing
+    sync gap. Mirrors build_acurite_frame; the real coding validated against rtl_433 captures."""
+    out = [pulse, -sync]
+    for bit in bits_msb(data4, 32):
+        out += [pulse, -(g1 if bit else g0)]
+    out += [pulse, -sync]
+    return out
+
+
 def fsk_nrz_frame(data, nbits, period=100, gap=8000):
     """2FSK PCM/NRZ run-length: coalesce equal consecutive bits into one run of count*period
     (sign + for 1, - for 0), then a long inter-frame gap. Mirrors build_fsk_frame."""
@@ -98,10 +119,11 @@ def main():
     ook = "FuriHalSubGhzPresetOok650Async"
     fsk = "FuriHalSubGhzPreset2FSKDev476Async"
 
-    # Acurite-606TX: 32-bit OOK PWM, byte 3 = CRC-8/0x07 over bytes 0..2 -> weather-acurite-433.
-    acu = bytes([0x3A, 0x21, 0x84, 0x00])
-    acu = bytes(acu[:3]) + bytes([crc8(acu[:3])])
-    f = pwm_bytes_frame(acu, 32)
+    # Acurite-606TX: 32-bit OOK gap/PPM, byte 3 = LFSR-8 digest over bytes 0..2 (real coding,
+    # validated vs rtl_433 captures; id 0x55 synthetic) -> weather-acurite-433.
+    acu = bytes([0x55, 0x80, 0x65])
+    acu = acu + bytes([lfsr_digest8(acu)])
+    f = acurite_frame(acu)
     write_sub(os.path.join(out_dir, "acurite_606_433.sub"), 433920000, ook, [f, f])
 
     # Nexus-TH: 36-bit OOK PPM, const 0xF nibble at bits 24..27, humidity 0x37 -> th-nexus-433.

@@ -803,6 +803,19 @@ uint8_t radiotchi_xor8(const uint8_t* data, uint16_t len) {
     return x;
 }
 
+uint8_t radiotchi_lfsr_digest8(const uint8_t* data, uint16_t len, uint8_t gen, uint8_t init) {
+    uint8_t sum = 0;
+    uint8_t key = init;
+    if(data == NULL) return 0;
+    for(uint16_t b = 0; b < len; b++) {
+        for(int i = 7; i >= 0; i--) {
+            if((data[b] >> i) & 1u) sum ^= key;
+            key = (key & 1u) ? (uint8_t)((key >> 1) ^ gen) : (uint8_t)(key >> 1);
+        }
+    }
+    return sum;
+}
+
 uint32_t radiotchi_bits_get(
     const uint8_t* bytes, uint16_t nbytes, uint16_t bit_off, uint8_t nbits) {
     uint32_t v = 0;
@@ -814,6 +827,30 @@ uint32_t radiotchi_bits_get(
         v = (v << 1) | bit;
     }
     return v;
+}
+
+#define WV_COALESCE_GLITCH_US 60u // dispatch pre-pass: drop sub-60us spikes (< every real bit unit)
+
+uint16_t radiotchi_coalesce_glitches(
+    const int16_t* in, uint16_t n, int16_t* out, uint16_t cap, uint16_t glitch_us) {
+    if(in == NULL || out == NULL || cap == 0) return 0;
+    uint16_t m = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        int32_t d = in[i];
+        uint32_t mag = (uint32_t)(d < 0 ? -d : d);
+        if(mag < glitch_us) continue; // drop a sub-glitch run; its same-sign neighbours then merge
+        bool neg = d < 0;
+        if(m > 0 && ((out[m - 1] < 0) == neg)) { // same sign as the kept previous run -> merge
+            int32_t sum = (int32_t)out[m - 1] + d;
+            if(sum > 32767) sum = 32767;
+            if(sum < -32768) sum = -32768;
+            out[m - 1] = (int16_t)sum;
+        } else {
+            if(m >= cap) break;
+            out[m++] = (int16_t)d;
+        }
+    }
+    return m;
 }
 
 int32_t radiotchi_find_sync(
@@ -1383,28 +1420,71 @@ static bool decode_fsk_sync_sensor(uint32_t band, const int16_t* pulses, uint16_
     return false;
 }
 
-// Named device decoder — Acurite 606TX outdoor thermometer (433.92 MHz OOK PWM). Documented
-// public layout: a 32-bit frame [id:8][flags:8][temp:8 (+4 high bits in flags)][crc:8] whose last
-// byte is CRC-8 (generator 0x07, init 0) over the first three. We gate on the exact length AND a
-// valid CRC over the documented region — a documented signature, not a guess — so a non-Acurite
-// frame practically never matches (the CRC must hold over exactly those 3 bytes). Reaches VALUES /
-// "weather-acurite-433"; the id lives only in the hashed `individual` tag (A5). We never surface
-// the decoded temperature, so the field math is irrelevant to what the dex shows. Pure.
+// Named device decoder — Acurite 606TX / Technoline TX960 thermometer (433.92 MHz OOK). VALIDATED
+// against real rtl_433_tests captures: the coding is gap/PPM (a fixed mark, then the GAP carries the
+// bit: short = 0, long = 1), and the 32-bit data frame [id:8][BbCC|temp_hi:4][temp_lo:8][digest:8]
+// is delimited by a long sync gap (~2x the long data gap). The check byte is an LFSR-8 digest
+// (`lfsr_digest8(b,3, gen 0x98, key 0xf1) == b[3]`), NOT a CRC/sum — confirmed on three real frames
+// (A3 80 65 EA / A3 80 6C 29 / A3 80 CD 22). Thresholds are estimated from the sync scale, so the
+// decoder is sample-rate-relative. Privacy (A5): species is family-level; the id only seeds the
+// one-way tag; the temperature is never surfaced. Pure.
 static bool decode_acurite606(uint32_t band, const int16_t* pulses, uint16_t n, CaptureEvent* ev) {
-    if(band != 433u) return false;
-    uint8_t f[RADIOTCHI_SENSOR_FRAME_MAX];
-    uint16_t nbits = 0;
-    if(!radiotchi_pwm_to_bytes(pulses, n, f, sizeof(f), &nbits)) return false;
-    if(nbits != 32u) return false; // exactly 4 bytes
-    if(f[0] == f[1] && f[1] == f[2] && f[2] == f[3]) return false; // degenerate: CRC8(00..)==00
-    if(radiotchi_crc8(f, 3, 0x07u, 0x00u) != f[3]) return false; // CRC-8/0x07 over bytes 0..2
+    if(band != 433u || n < 32u) return false;
+
+    // Sync-gap scale = the largest space below the inter-message silence (>=30 ms after clamping).
+    uint32_t maxsp = 0;
+    for(uint16_t i = 0; i < n; i++) {
+        if(pulses[i] >= 0) continue;
+        uint32_t m = (uint32_t)(-pulses[i]);
+        if(m < 30000u && m > maxsp) maxsp = m;
+    }
+    if(maxsp < 4000u) return false; // no sync gap of the right scale -> not Acurite framing
+    uint32_t sync_thr = (maxsp * 6u) / 10u; // a sync gap; a long data gap stays below this
+    uint32_t bit_thr = maxsp / 3u; // between the short(0) and long(1) data gaps
+
+    // Decode the first complete 32-bit frame that sits between two sync gaps (gap = the bit).
+    uint8_t f[4] = {0, 0, 0, 0};
+    bool after_sync = false;
+    uint16_t count = 0;
+    for(uint16_t i = 0; i + 1 < n;) {
+        if(pulses[i] < 0) { // not on a mark (e.g. the sync space itself) -> step to the next
+            i++;
+            continue;
+        }
+        if(pulses[i + 1] >= 0) { // expected a (mark, space) pair
+            i++;
+            continue;
+        }
+        uint32_t space = (uint32_t)(-pulses[i + 1]);
+        i += 2;
+        if(space >= sync_thr) { // a sync gap delimits the frame
+            if(after_sync && count == 32u) break; // a full frame just completed
+            after_sync = true; // (re)start a frame after this sync
+            count = 0;
+            f[0] = f[1] = f[2] = f[3] = 0;
+            continue;
+        }
+        if(!after_sync) continue; // still before the first sync (mid-stream start)
+        if(count >= 32u) { // overran a clean 32-bit frame -> wait for the next sync
+            after_sync = false;
+            continue;
+        }
+        if(space > bit_thr) f[count >> 3] |= (uint8_t)(0x80u >> (count & 7u));
+        count++;
+    }
+    if(!(after_sync && count == 32u)) return false;
+    if(f[0] == 0 && f[1] == 0 && f[2] == 0 && f[3] == 0) return false; // blank
+    if(radiotchi_lfsr_digest8(f, 3, 0x98u, 0xf1u) != f[3]) return false; // the integrity gate
 
     ev->decode_tier = TIER_VALUES;
     strncpy(ev->protocol, "Acurite-606", sizeof(ev->protocol) - 1);
     ev->protocol[sizeof(ev->protocol) - 1] = '\0';
     strncpy(ev->species_id, "weather-acurite-433", sizeof(ev->species_id) - 1);
     ev->species_id[sizeof(ev->species_id) - 1] = '\0';
-    radiotchi_individual_fingerprint_bytes(f, 4, ev->individual, sizeof(ev->individual));
+    // Per-device tag = hash of the ID byte ONLY (byte 0): the rest of the frame carries the varying
+    // temperature, so hashing it would mint a new "individual" every reading instead of tracking the
+    // one device over time (A5/D27 recurrence).
+    radiotchi_individual_fingerprint_bytes(f, 1, ev->individual, sizeof(ev->individual));
     return true;
 }
 
@@ -1435,7 +1515,8 @@ static bool decode_nexus_th(uint32_t band, const int16_t* pulses, uint16_t n, Ca
     ev->protocol[sizeof(ev->protocol) - 1] = '\0';
     strncpy(ev->species_id, "th-nexus-433", sizeof(ev->species_id) - 1);
     ev->species_id[sizeof(ev->species_id) - 1] = '\0';
-    radiotchi_individual_fingerprint_bytes(f, nbytes, ev->individual, sizeof(ev->individual));
+    // Per-device tag = the ID byte only (byte 0); the rest varies with temp/humidity each reading.
+    radiotchi_individual_fingerprint_bytes(f, 1, ev->individual, sizeof(ev->individual));
     return true;
 }
 
@@ -1446,6 +1527,15 @@ bool radiotchi_decode_from_pulses(
     uint16_t n,
     CaptureEvent* ev) {
     if(ev == NULL || pulses == NULL || n == 0) return false;
+
+    // Glitch-coalesce the train ONCE so the pair-walking PWM/PPM slicers don't desync on a slicer
+    // dip that split a pulse (real IQ/RX captures have these; the synthetic test frames did not, so
+    // it is a no-op there). 60us is below every protocol's real bit unit (>=100us) and above the
+    // spikes. The element-by-element decoders already glitch-filter, so a cleaned train is harmless.
+    int16_t clean[RADIOTCHI_PULSES_MAX];
+    n = radiotchi_coalesce_glitches(pulses, n, clean, RADIOTCHI_PULSES_MAX, WV_COALESCE_GLITCH_US);
+    pulses = clean;
+    if(n == 0) return false;
     uint32_t band = band_bucket_mhz(frequency_hz);
 
     // Order = specificity; the first match wins. Named device decoders (documented signatures)
